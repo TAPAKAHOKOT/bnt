@@ -22,10 +22,16 @@ static constexpr uint32_t SAMPLE_RATE = 16000;
 static constexpr uint32_t DEBOUNCE_MS = 30;
 static constexpr uint32_t VOLUME_LOG_INTERVAL_MS = 120;
 static constexpr uint32_t BEEP_DURATION_MS = 90;
-static constexpr uint32_t BEEP_FREQ_HZ = 880;
 static constexpr float BEEP_GAIN = 0.18f;
+static constexpr uint32_t REC_START_FREQ_HZ = 988;  // rising cue: recording started
+static constexpr uint32_t REC_END_FREQ_HZ = 587;    // lower cue: recording stopped
+// Quiet periodic "thinking" blip while waiting for the backend response.
+static constexpr uint32_t THINKING_FREQ_HZ = 440;
+static constexpr uint32_t THINKING_BLIP_MS = 60;
+static constexpr float THINKING_GAIN = 0.05f;
+static constexpr uint32_t THINKING_INTERVAL_MS = 700;
 static constexpr int32_t MIC_GAIN = 3;
-static constexpr int32_t PLAYBACK_GAIN = 1;
+static constexpr float PLAYBACK_GAIN = 1.5f;  // a bit louder (was 1.0; 2.0 clipped)
 // Stereo frames read per i2s_read and streamed as one HTTP chunk. Larger =
 // fewer, bigger socket writes (closer to one TCP segment) — better on weak Wi-Fi.
 static constexpr size_t MIC_READ_FRAMES = 512;
@@ -233,14 +239,9 @@ static void writeSpeakerSilence(uint32_t durationMs) {
   }
 }
 
-static void playBeep() {
-  Serial.println("[audio_out] beep");
-
-  startSpeakerI2S();
-  setAmpEnabled(true);
-  delay(8);
-
-  const uint32_t totalSamples = SAMPLE_RATE * BEEP_DURATION_MS / 1000;
+// Write a sine tone to the speaker I2S (assumes it is already set up + amp on).
+static void writeToneToI2S(uint32_t freqHz, uint32_t durationMs, float gain) {
+  const uint32_t totalSamples = SAMPLE_RATE * durationMs / 1000;
   int16_t buffer[128 * 2];
   uint32_t produced = 0;
 
@@ -248,8 +249,8 @@ static void playBeep() {
     const uint32_t count = minU32(128, totalSamples - produced);
 
     for (uint32_t i = 0; i < count; ++i) {
-      const float phase = 2.0f * PI * BEEP_FREQ_HZ * static_cast<float>(produced + i) / SAMPLE_RATE;
-      const int16_t sample = static_cast<int16_t>(sinf(phase) * 32767.0f * BEEP_GAIN);
+      const float phase = 2.0f * PI * freqHz * static_cast<float>(produced + i) / SAMPLE_RATE;
+      const int16_t sample = static_cast<int16_t>(sinf(phase) * 32767.0f * gain);
       buffer[i * 2] = sample;
       buffer[i * 2 + 1] = sample;
     }
@@ -258,7 +259,14 @@ static void playBeep() {
     i2s_write(I2S_PORT, buffer, count * 2 * sizeof(int16_t), &bytesWritten, portMAX_DELAY);
     produced += count;
   }
+}
 
+// Standalone short cue tone: set up the speaker, play, tear down.
+static void playCue(uint32_t freqHz) {
+  startSpeakerI2S();
+  setAmpEnabled(true);
+  delay(8);
+  writeToneToI2S(freqHz, BEEP_DURATION_MS, BEEP_GAIN);
   writeSpeakerSilence(30);
   i2s_zero_dma_buffer(I2S_PORT);
   delay(10);
@@ -575,7 +583,7 @@ static size_t streamResponseToSpeaker(WiFiClient &client, long contentLength) {
                                                   (static_cast<uint16_t>(in[i]) << 8));
       havePending = false;
 
-      int32_t amplified = static_cast<int32_t>(sample) * PLAYBACK_GAIN;
+      int32_t amplified = static_cast<int32_t>(static_cast<float>(sample) * PLAYBACK_GAIN);
       if (amplified > 32767) {
         amplified = 32767;
       } else if (amplified < -32768) {
@@ -666,6 +674,27 @@ static bool finishUploadAndPlay() {
   uploadClient.print("0\r\n\r\n");
   uploadActive = false;
 
+  // Set up the speaker and play a quiet periodic "thinking" blip while the
+  // backend runs STT -> chat -> TTS. streamResponseToSpeaker reuses this same
+  // I2S setup (its startSpeakerI2S is a no-op) and tears it down at the end.
+  startSpeakerI2S();
+  setAmpEnabled(true);
+  delay(8);
+  {
+    const uint32_t waitStart = millis();
+    uint32_t lastBlip = 0;
+    while (uploadClient.available() == 0 && uploadClient.connected() &&
+           millis() - waitStart < BACKEND_RESPONSE_TIMEOUT_MS) {
+      const uint32_t now = millis();
+      if (now - lastBlip >= THINKING_INTERVAL_MS) {
+        lastBlip = now;
+        writeToneToI2S(THINKING_FREQ_HZ, THINKING_BLIP_MS, THINKING_GAIN);
+      } else {
+        delay(5);
+      }
+    }
+  }
+
   // Status line: "HTTP/1.1 200 OK".
   const String statusLine = uploadClient.readStringUntil('\n');
   int statusCode = 0;
@@ -695,6 +724,13 @@ static bool finishUploadAndPlay() {
   if (statusCode != 200) {
     Serial.printf("[network] status=%d content_length=%ld\n", statusCode, contentLength);
     uploadClient.stop();
+    // Tear down the speaker we set up for the thinking tone (no playback follows).
+    i2s_zero_dma_buffer(I2S_PORT);
+    delay(10);
+    setAmpEnabled(false);
+    delay(10);
+    stopI2S();
+    silenceSpeakerPins();
     return false;
   }
 
@@ -800,7 +836,7 @@ void setup() {
   Serial.println("[boot] button GPIO13 INPUT_PULLUP, pressed=LOW");
   Serial.println("[boot] speaker I2S TX GPIO27/22/21, amp SD GPIO14");
   Serial.println("[boot] mic I2S RX GPIO26/25/33, stereo diagnostic slots, INMP441 L/R=GND");
-  Serial.printf("[boot] mic_gain=%ld playback_gain=%ld\n", static_cast<long>(MIC_GAIN), static_cast<long>(PLAYBACK_GAIN));
+  Serial.printf("[boot] mic_gain=%ld playback_gain=%.2f\n", static_cast<long>(MIC_GAIN), PLAYBACK_GAIN);
 
   connectWiFi();
 }
@@ -812,7 +848,8 @@ void loop() {
   if (pressed && !wasPressed) {
     wasPressed = true;
     Serial.println("[button] pressed");
-    playBeep();
+    Serial.println("[audio_out] cue: record start");
+    playCue(REC_START_FREQ_HZ);
     beginUpload();  // open chunked connection before recording (sets uploadActive)
     startMicI2S();
     resetRecordingStats();
@@ -828,6 +865,8 @@ void loop() {
     Serial.println("[button] released");
     stopMic();
     printRecordingSummary();
+    Serial.println("[audio_out] cue: record stop");
+    playCue(REC_END_FREQ_HZ);
     if (!finishUploadAndPlay()) {
       Serial.println("[audio_out] no response (upload failed or offline)");
     }

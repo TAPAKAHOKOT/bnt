@@ -103,17 +103,22 @@ BNT_SERIAL_OK baud=115200
 [wifi] connecting ssid=...
 [wifi] connected ip=... rssi=... backend=http://.../ask-audio
 [button] pressed
-[audio_out] beep
+[audio_out] cue: record start
 [audio_in] mic start
 [network] upload started (chunked) url=http://.../ask-audio
 [recording] ms=... bytes=... samples=... volume=... slot0=... slot1=... read_bytes=... streamed=...
 [button] released
 [audio_in] mic stop
 [recording] done duration_ms=... bytes=... samples=... peak=... rms=...
+[audio_out] cue: record stop
 [network] status=200 content_length=... text=...
 [audio_out] source=backend_response (streamed)
 [audio_out] streamed samples=...
 ```
+
+Audio cues: a short rising tone marks **recording start** and a lower tone marks
+**recording stop**. While the backend runs STT→chat→TTS, the speaker plays a
+quiet periodic "thinking" blip until the response begins streaming.
 
 Neither recording nor playback is buffered in full: the mic PCM is streamed up
 as it is captured, and the response is streamed to the speaker as it downloads,
@@ -141,12 +146,10 @@ Two constants control loudness/sensitivity in `src/main.cpp`:
 
 ```cpp
 static constexpr int32_t MIC_GAIN = 3;
-static constexpr int32_t PLAYBACK_GAIN = 1;
+static constexpr float PLAYBACK_GAIN = 1.5f;
 ```
 
-`PLAYBACK_GAIN = 2` introduced slight clipping/hiss on this wiring, so it is
-kept at `1`.
-
-`MIC_GAIN` amplifies microphone samples before storing them in RAM.
-`PLAYBACK_GAIN` amplifies stored PCM only when playing it through MAX98357.
-Both are clipped to signed 16-bit PCM to avoid integer overflow.
+`MIC_GAIN` amplifies microphone samples before streaming them up.
+`PLAYBACK_GAIN` amplifies the response PCM before the MAX98357. `2.0` clipped on
+this wiring; `1.5` is a bit louder than unity while staying mostly clean (output
+is clipped to signed 16-bit, so very loud passages may distort slightly).
