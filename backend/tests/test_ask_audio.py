@@ -26,6 +26,24 @@ def test_ask_audio_accepts_valid_wav_and_returns_mvp_wav() -> None:
     assert info.frames > 0
 
 
+def test_ask_audio_accepts_raw_pcm_stream() -> None:
+    # Raw 16-bit mono 16kHz PCM (no WAV header), as the firmware streams it.
+    pcm = b"\x00\x01" * 1600  # 100 ms of PCM
+    response = client.post("/ask-audio", content=pcm, headers={"Content-Type": "audio/L16;rate=16000;channels=1"})
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("audio/wav")
+    info = validate_mvp_wav(response.content)
+    assert info.frames > 0
+
+
+def test_ask_audio_rejects_empty_raw_pcm() -> None:
+    response = client.post("/ask-audio", content=b"", headers={"Content-Type": "audio/L16"})
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "empty_audio"
+
+
 def test_ask_audio_rejects_empty_audio() -> None:
     response = client.post("/ask-audio", content=b"", headers={"Content-Type": "audio/wav"})
 

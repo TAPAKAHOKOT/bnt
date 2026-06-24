@@ -13,7 +13,13 @@ from backend.app.config import BackendConfig, load_config
 from backend.app.services.fake_response_service import FakeResponseService
 from backend.app.services.openai_response_service import OpenAIResponseService
 from backend.app.services.response_service import ResponseService, ResponseServiceError
-from bnt_core.wav import WavValidationError, validate_mvp_wav
+from bnt_core.wav import WavValidationError, pcm16_to_mvp_wav, validate_mvp_wav
+
+# Content type accepted as raw little-endian 16-bit mono 16 kHz PCM (no WAV
+# header). The firmware streams audio this way (chunked) because it cannot know
+# the final length up front to write a correct WAV header; the backend wraps it.
+# audio/L16 is the standard MIME type for raw 16-bit linear PCM.
+_RAW_PCM_CONTENT_TYPES = {"audio/l16"}
 
 router = APIRouter()
 logger = logging.getLogger("bnt.backend.ask_audio")
@@ -43,17 +49,28 @@ async def ask_audio(
     request_id = str(uuid.uuid4())
     started = time.monotonic()
 
-    if content_type is None or content_type.split(";")[0].strip().lower() != "audio/wav":
-        return _error("invalid_audio", "Content-Type must be audio/wav", request_id, status_code=400)
+    base_type = (content_type or "").split(";")[0].strip().lower()
+    is_raw_pcm = base_type in _RAW_PCM_CONTENT_TYPES
+    if base_type != "audio/wav" and not is_raw_pcm:
+        return _error("invalid_audio", "Content-Type must be audio/wav or audio/L16", request_id, status_code=400)
 
     if content_length is not None and content_length > config.max_request_bytes:
         return _error("payload_too_large", "Audio payload is too large", request_id, status_code=413)
 
     body = await request.body()
-    logger.info("[request] id=%s POST /ask-audio bytes=%s", request_id, len(body))
+    logger.info(
+        "[request] id=%s POST /ask-audio bytes=%s raw_pcm=%s", request_id, len(body), is_raw_pcm
+    )
 
     if len(body) > config.max_request_bytes:
         return _error("payload_too_large", "Audio payload is too large", request_id, status_code=413)
+
+    # Streamed raw PCM has no header — wrap it into the MVP WAV before validating
+    # so the rest of the pipeline is identical for both wire formats.
+    if is_raw_pcm:
+        if len(body) < 2:
+            return _error("empty_audio", "Audio payload is empty", request_id, status_code=400)
+        body = pcm16_to_mvp_wav(body)
 
     try:
         audio_info = validate_request_wav(body)
