@@ -7,7 +7,7 @@ from dataclasses import dataclass
 DEFAULT_OPENAI_CHAT_MODEL = "gpt-4o-mini"
 DEFAULT_OPENAI_STT_MODEL = "whisper-1"
 DEFAULT_OPENAI_TTS_MODEL = "gpt-4o-mini-tts"
-DEFAULT_OPENAI_TTS_VOICE = "sol"
+DEFAULT_OPENAI_TTS_VOICE = "sage"
 
 
 @dataclass(frozen=True)
