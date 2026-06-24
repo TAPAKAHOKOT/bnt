@@ -101,17 +101,15 @@ BNT_SERIAL_OK baud=115200
 [recording] done duration_ms=... bytes=... samples=... peak=... rms=... checksum=... overflow=no
 [wav] bytes=... pcm_bytes=... sample_rate=16000 channels=1 bits=16 valid=yes
 [network] POST started bytes=... url=http://.../ask-audio
-[network] status=200 latency_ms=... response bytes=... valid=yes pcm_samples=... truncated=no text=...
-[audio_out] source=backend_response
-[audio_out] playback start bytes=... samples=...
-[audio_out] playback done
+[network] status=200 latency_ms=... content_length=... text=...
+[audio_out] source=backend_response (streamed)
+[audio_out] streamed samples=...
 ```
 
-`[audio_out] source=` shows whether playback is the `backend_response` (a 200
-with a valid WAV) or `local_recording` (any network failure → offline
-fallback). The backend response is decoded straight into the record buffer, so
-it is capped to the 3-second buffer (`truncated=yes` if the response was
-longer).
+`[audio_out] source=` shows whether playback is the streamed `backend_response`
+(a 200 with a valid WAV header) or `local_recording` (any network failure →
+offline fallback). The response is streamed to the speaker as it downloads, so
+its length is not bounded by RAM.
 
 After each recording the firmware wraps the captured PCM in a canonical
 44-byte WAV/PCM header (built in RAM, PCM left in place) and validates every
@@ -142,9 +140,16 @@ contiguous block fits AND enough heap is left for the Wi-Fi stack:
 The real ceiling is the largest contiguous heap block (~110-150 KB ≈ 3.5-4.5 s),
 not total free memory — the ESP32 heap is split into regions, so a single 192 KB
 (6 s) block does not exist even with ~300 KB free. This board has no PSRAM to
-grow it. The same buffer is reused for the backend response, so the actual
-allocated duration also caps response playback. If allocation fails entirely,
-recording is skipped safely instead of crashing.
+grow it. This buffer caps the **recording** length only. If allocation fails
+entirely, recording is skipped safely instead of crashing.
+
+The **backend response is streamed** straight to the speaker as it downloads
+(see `streamResponseToSpeaker`), so response length is **not** capped by RAM —
+no full-clip buffer is allocated for playback. The enlarged I2S TX DMA buffers
+provide the jitter cushion; on a weak Wi-Fi link a slow chunk can cause a brief
+audible underrun. If the request fails (no Wi-Fi, non-200, bad header) nothing
+is streamed and the device falls back to playing the local recording
+(`[audio_out] source=local_recording`).
 
 If `overflow=yes`, the button was held longer than the current RAM recording limit.
 Playback uses the recorded mono PCM buffer and duplicates it to both MAX98357 I2S output channels.

@@ -38,8 +38,14 @@ static constexpr int32_t PLAYBACK_GAIN = 1;
 
 static constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
 static constexpr uint32_t HTTP_TIMEOUT_MS = 10000;
-// First-hardware response cap from the MVP audio contract.
-static constexpr size_t MAX_RESPONSE_BYTES = 200 * 1024;
+// The backend runs STT -> chat -> TTS via OpenAI, which can take tens of seconds
+// (slow/retried calls). Wait this long for the response status before giving up.
+static constexpr uint32_t BACKEND_RESPONSE_TIMEOUT_MS = 45000;
+// Streaming playback tuning: abort a stalled stream fast (real-time path) and
+// prefill the socket buffer before starting the DACs so the DMA ring has a lead.
+static constexpr uint32_t STREAM_IDLE_TIMEOUT_MS = 2000;
+static constexpr size_t STREAM_PREBUFFER_BYTES = 2048;
+static constexpr uint32_t STREAM_PREBUFFER_WAIT_MS = 400;
 
 // MVP wire format: mono 16 kHz signed 16-bit little-endian PCM in a WAV container.
 static constexpr uint16_t WAV_CHANNELS = 1;
@@ -114,7 +120,7 @@ static void startSpeakerI2S() {
   config.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
   config.communication_format = I2S_COMM_FORMAT;
   config.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
-  config.dma_buf_count = 4;
+  config.dma_buf_count = 16;  // ~256 ms TX cushion to absorb network jitter when streaming
   config.dma_buf_len = 256;
   config.use_apll = false;
   config.tx_desc_auto_clear = true;
@@ -505,9 +511,10 @@ static void wrapRecordingAsWav() {
       valid ? "yes" : "no");
 }
 
-// Light validation of the backend's WAV response against the MVP contract:
-// chunk markers plus PCM/mono/16kHz/16-bit format fields. We do not assert the
-// data-chunk offset because the response may carry extra chunks.
+// Validate the backend's WAV response against the MVP contract. We require the
+// canonical 44-byte layout (data chunk at offset 36) because streaming playback
+// treats everything after byte 44 as PCM — a LIST/fact chunk before data would
+// otherwise be played as noise. The backend emits exactly this layout.
 static bool validateResponseWav(const uint8_t *wav, size_t len) {
   if (len < WAV_HEADER_SIZE) {
     return false;
@@ -516,6 +523,7 @@ static bool validateResponseWav(const uint8_t *wav, size_t len) {
   ok = ok && memcmp(wav + 0, "RIFF", 4) == 0;
   ok = ok && memcmp(wav + 8, "WAVE", 4) == 0;
   ok = ok && memcmp(wav + 12, "fmt ", 4) == 0;
+  ok = ok && memcmp(wav + 36, "data", 4) == 0;           // PCM must start at byte 44
   ok = ok && readLe16(wav + 20) == 1;                    // PCM
   ok = ok && readLe16(wav + 22) == WAV_CHANNELS;         // mono
   ok = ok && readLe32(wav + 24) == SAMPLE_RATE;          // 16000 Hz
@@ -571,16 +579,163 @@ static bool parseBackendUrl(char *host, size_t hostCap, uint16_t *port, char *pa
   return true;
 }
 
+// Read exactly n bytes from the socket, or fewer on disconnect/idle timeout.
+static size_t readFully(WiFiClient &client, uint8_t *dst, size_t n, uint32_t timeoutMs) {
+  size_t got = 0;
+  uint32_t lastData = millis();
+  while (got < n) {
+    const int avail = client.available();
+    if (avail <= 0) {
+      if (!client.connected()) {
+        break;
+      }
+      if (millis() - lastData > timeoutMs) {
+        break;
+      }
+      delay(1);
+      continue;
+    }
+    const int r = client.read(dst + got, n - got);
+    if (r > 0) {
+      got += static_cast<size_t>(r);
+      lastData = millis();
+    } else if (!client.connected()) {
+      break;
+    }
+  }
+  return got;
+}
+
+// Stream the WAV response body straight to the speaker without buffering the
+// whole clip: read and validate the 44-byte header, then read PCM in small
+// chunks and feed I2S TX as it arrives. This removes the response-length RAM
+// cap — the big recording buffer is never used for playback. The enlarged I2S
+// DMA buffers are the jitter cushion; a slow network can cause brief underruns.
+// Returns the number of mono samples played (0 = nothing/invalid header).
+static size_t streamResponseToSpeaker(WiFiClient &client, long contentLength) {
+  uint8_t header[WAV_HEADER_SIZE];
+  if (readFully(client, header, WAV_HEADER_SIZE, HTTP_TIMEOUT_MS) != WAV_HEADER_SIZE) {
+    Serial.println("[audio_out] stream: short header");
+    return 0;
+  }
+  if (!validateResponseWav(header, WAV_HEADER_SIZE)) {
+    Serial.println("[audio_out] stream: invalid wav header");
+    return 0;
+  }
+
+  // Remaining PCM byte budget (header already consumed). -1 = stream until close.
+  long dataRemaining = contentLength > 0 ? contentLength - static_cast<long>(WAV_HEADER_SIZE) : -1;
+
+  // Prebuffer: let the socket queue some PCM before the DACs start draining, so
+  // the first reads fill the DMA ring and give a lead against the first stall.
+  const uint32_t preStart = millis();
+  while (client.connected() &&
+         static_cast<size_t>(client.available()) < STREAM_PREBUFFER_BYTES &&
+         millis() - preStart < STREAM_PREBUFFER_WAIT_MS) {
+    delay(2);
+  }
+
+  startSpeakerI2S();
+  setAmpEnabled(true);
+  delay(8);
+
+  int16_t out[256 * 2];
+  size_t outFrames = 0;
+  uint8_t in[512];
+  uint8_t pendingLow = 0;
+  bool havePending = false;
+  size_t samplesPlayed = 0;
+  uint32_t lastData = millis();
+
+  while (dataRemaining != 0) {
+    const int avail = client.available();
+    if (avail <= 0) {
+      if (!client.connected()) {
+        break;
+      }
+      if (millis() - lastData > STREAM_IDLE_TIMEOUT_MS) {
+        Serial.println("[audio_out] stream: idle timeout (aborting)");
+        break;
+      }
+      delay(1);
+      continue;
+    }
+
+    size_t toRead = sizeof(in);
+    if (dataRemaining > 0 && static_cast<long>(toRead) > dataRemaining) {
+      toRead = static_cast<size_t>(dataRemaining);
+    }
+    const int r = client.read(in, toRead);
+    if (r <= 0) {
+      if (!client.connected()) {
+        break;
+      }
+      continue;
+    }
+    lastData = millis();
+    if (dataRemaining > 0) {
+      dataRemaining -= r;
+    }
+
+    for (int i = 0; i < r; ++i) {
+      if (!havePending) {
+        pendingLow = in[i];
+        havePending = true;
+        continue;
+      }
+      const int16_t sample = static_cast<int16_t>(static_cast<uint16_t>(pendingLow) |
+                                                  (static_cast<uint16_t>(in[i]) << 8));
+      havePending = false;
+
+      int32_t amplified = static_cast<int32_t>(sample) * PLAYBACK_GAIN;
+      if (amplified > 32767) {
+        amplified = 32767;
+      } else if (amplified < -32768) {
+        amplified = -32768;
+      }
+
+      const int16_t s16 = static_cast<int16_t>(amplified);
+      out[outFrames * 2] = s16;
+      out[outFrames * 2 + 1] = s16;
+      outFrames++;
+      samplesPlayed++;
+
+      if (outFrames == 256) {
+        size_t wrote = 0;
+        i2s_write(I2S_PORT, out, outFrames * 2 * sizeof(int16_t), &wrote, portMAX_DELAY);
+        outFrames = 0;
+      }
+    }
+  }
+
+  if (outFrames > 0) {
+    size_t wrote = 0;
+    i2s_write(I2S_PORT, out, outFrames * 2 * sizeof(int16_t), &wrote, portMAX_DELAY);
+  }
+
+  if (dataRemaining > 0) {
+    Serial.printf("[audio_out] stream: truncated, %ld bytes unplayed\n", dataRemaining);
+  }
+
+  writeSpeakerSilence(40);
+  i2s_zero_dma_buffer(I2S_PORT);
+  delay(10);
+  setAmpEnabled(false);
+  delay(10);
+  stopI2S();
+  silenceSpeakerPins();
+  return samplesPlayed;
+}
+
 // Steps 2-3 of the firmware/backend bridge: stream the in-RAM WAV (header +
 // PCM) to the backend over a raw socket — header first, then PCM in chunks
-// straight from the record buffer. This avoids a second large contiguous
-// buffer, which the heap cannot supply once the recording buffer is allocated.
-// On a 200 response, the response PCM is decoded back into recordingPcm (the
-// request audio is already sent, so the buffer is free) and the caller plays
-// it. On any failure recordingPcm is left untouched, so the device falls back
-// to playing the local recording. Failure is non-fatal.
+// straight from the record buffer (no second large contiguous buffer). On a 200
+// response the WAV body is streamed straight to the speaker (see
+// streamResponseToSpeaker), so response length is not capped by RAM. On any
+// failure nothing is played and the caller falls back to the local recording.
+// Failure is non-fatal.
 //
-// Returns true if recordingPcm now holds backend response PCM to play.
+// Returns true if the backend response was streamed to the speaker.
 static bool sendWavToBackend() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[network] skipped: wifi not connected");
@@ -608,7 +763,8 @@ static bool sendWavToBackend() {
     Serial.printf("[network] connect failed host=%s port=%u\n", host, static_cast<unsigned int>(port));
     return false;
   }
-  client.setTimeout(HTTP_TIMEOUT_MS / 1000);
+  // setTimeout is in seconds on the ESP32 Client; cover the slow OpenAI pipeline.
+  client.setTimeout(BACKEND_RESPONSE_TIMEOUT_MS / 1000);
 
   Serial.printf("[network] POST started bytes=%u url=%s\n",
                 static_cast<unsigned int>(wavBytes), BNT_BACKEND_URL);
@@ -673,71 +829,18 @@ static bool sendWavToBackend() {
     return false;
   }
 
-  if (contentLength > static_cast<long>(MAX_RESPONSE_BYTES)) {
-    Serial.printf("[network] response too large: %ld > %u\n",
-                  contentLength, static_cast<unsigned int>(MAX_RESPONSE_BYTES));
-    client.stop();
-    return false;
-  }
+  // No response-size cap: playback is streamed, so length is bounded by the
+  // connection/idle timeout, not by RAM.
+  Serial.printf("[network] status=200 latency_ms=%lu content_length=%ld text=%s\n",
+                static_cast<unsigned long>(latencyMs), contentLength, bntText.c_str());
 
-  // Read the body: keep the first 44 bytes for header validation, then decode
-  // the PCM straight into recordingPcm (request audio is already sent, so the
-  // buffer is free). Bytes are little-endian on both wire and ESP32, so a raw
-  // byte copy yields valid int16 samples. Capped to the record buffer size.
-  uint8_t head[WAV_HEADER_SIZE] = {};
-  uint8_t *pcmDst = reinterpret_cast<uint8_t *>(recordingPcm);
-  const size_t pcmCap = recordingCapacitySamples * sizeof(int16_t);
-  size_t bodyBytes = 0;
-  size_t pcmStored = 0;
-  bool responseTruncated = false;
-  uint8_t buf[256];
-  const uint32_t readStart = millis();
-  while (millis() - readStart < HTTP_TIMEOUT_MS) {
-    const int avail = client.available();
-    if (avail <= 0) {
-      if (!client.connected()) {
-        break;
-      }
-      delay(2);
-      continue;
-    }
-    const int r = client.read(buf, sizeof(buf));
-    if (r <= 0) {
-      break;
-    }
-    for (int i = 0; i < r; ++i) {
-      const size_t pos = bodyBytes + static_cast<size_t>(i);
-      if (pos < WAV_HEADER_SIZE) {
-        head[pos] = buf[i];
-      } else if (pcmStored < pcmCap) {
-        pcmDst[pcmStored++] = buf[i];
-      } else {
-        responseTruncated = true;
-      }
-    }
-    bodyBytes += static_cast<size_t>(r);
-    if (contentLength > 0 && bodyBytes >= static_cast<size_t>(contentLength)) {
-      break;
-    }
-  }
+  // Stream the response straight to the speaker — no full-clip buffer.
+  Serial.println("[audio_out] source=backend_response (streamed)");
+  const size_t played = streamResponseToSpeaker(client, contentLength);
   client.stop();
+  Serial.printf("[audio_out] streamed samples=%u\n", static_cast<unsigned int>(played));
 
-  const size_t headFilled = bodyBytes < WAV_HEADER_SIZE ? bodyBytes : WAV_HEADER_SIZE;
-  const bool valid = validateResponseWav(head, headFilled);
-
-  // Hand the decoded response PCM to the playback path (drop a trailing odd byte).
-  recordingSampleCount = pcmStored / sizeof(int16_t);
-
-  Serial.printf(
-      "[network] status=200 latency_ms=%lu response bytes=%u valid=%s pcm_samples=%u truncated=%s text=%s\n",
-      static_cast<unsigned long>(latencyMs),
-      static_cast<unsigned int>(bodyBytes),
-      valid ? "yes" : "no",
-      static_cast<unsigned int>(recordingSampleCount),
-      responseTruncated ? "yes" : "no",
-      bntText.c_str());
-
-  return valid && recordingSampleCount > 0;
+  return played > 0;
 }
 
 static bool readDebouncedButtonPressed() {
@@ -876,9 +979,11 @@ void loop() {
     stopMic();
     printRecordingSummary();
     wrapRecordingAsWav();
-    const bool playingResponse = sendWavToBackend();
-    Serial.printf("[audio_out] source=%s\n", playingResponse ? "backend_response" : "local_recording");
-    playRecordedAudio();
+    const bool playedResponse = sendWavToBackend();
+    if (!playedResponse) {
+      Serial.println("[audio_out] source=local_recording");
+      playRecordedAudio();
+    }
   }
 
   delay(5);
