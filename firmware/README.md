@@ -78,9 +78,22 @@ BNT_SERIAL_OK baud=115200
 [button] released
 [audio_in] mic stop
 [recording] done duration_ms=... bytes=... samples=... peak=... rms=... checksum=... overflow=no
+[wav] bytes=... pcm_bytes=... sample_rate=16000 channels=1 bits=16 valid=yes
 [audio_out] playback start bytes=... samples=...
 [audio_out] playback done
 ```
+
+After each recording the firmware wraps the captured PCM in a canonical
+44-byte WAV/PCM header (built in RAM, PCM left in place) and validates every
+field against the MVP wire contract:
+
+- `RIFF`/`WAVE`/`fmt `/`data` chunk markers present
+- mono (`channels=1`), `16000` Hz, `16`-bit PCM
+- header `data` size equals the recorded PCM byte count
+- `bytes` = 44-byte header + `pcm_bytes`
+
+`valid=yes` confirms the header parses against the recorded PCM. No Wi-Fi,
+backend, or file write is involved yet; this only proves the WAV shape in RAM.
 
 For INMP441 debugging:
 
@@ -103,8 +116,11 @@ Two constants control loudness/sensitivity in `src/main.cpp`:
 
 ```cpp
 static constexpr int32_t MIC_GAIN = 3;
-static constexpr int32_t PLAYBACK_GAIN = 2;
+static constexpr int32_t PLAYBACK_GAIN = 1;
 ```
+
+`PLAYBACK_GAIN = 2` introduced slight clipping/hiss on this wiring, so it is
+kept at `1`.
 
 `MIC_GAIN` amplifies microphone samples before storing them in RAM.
 `PLAYBACK_GAIN` amplifies stored PCM only when playing it through MAX98357.

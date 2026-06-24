@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <string.h>
 #include "driver/i2s.h"
 
 // Confirmed breadboard wiring.
@@ -25,6 +26,11 @@ static constexpr float BEEP_GAIN = 0.18f;
 static constexpr int32_t MIC_GAIN = 3;
 static constexpr int32_t PLAYBACK_GAIN = 1;
 
+// MVP wire format: mono 16 kHz signed 16-bit little-endian PCM in a WAV container.
+static constexpr uint16_t WAV_CHANNELS = 1;
+static constexpr uint16_t WAV_BITS_PER_SAMPLE = 16;
+static constexpr size_t WAV_HEADER_SIZE = 44;
+
 static constexpr i2s_comm_format_t I2S_COMM_FORMAT = I2S_COMM_FORMAT_STAND_I2S;
 
 enum class I2SMode {
@@ -47,6 +53,7 @@ struct RecordingStats {
 };
 
 static int16_t *recordingPcm = nullptr;
+static uint8_t wavHeader[WAV_HEADER_SIZE];
 static size_t recordingSampleCount = 0;
 static uint32_t recordingStartedAt = 0;
 static uint32_t recordingPeak = 0;
@@ -400,6 +407,89 @@ static void printRecordingSummary() {
       recordingOverflow ? "yes" : "no");
 }
 
+static void writeLe16(uint8_t *dst, uint16_t value) {
+  dst[0] = static_cast<uint8_t>(value & 0xFF);
+  dst[1] = static_cast<uint8_t>((value >> 8) & 0xFF);
+}
+
+static void writeLe32(uint8_t *dst, uint32_t value) {
+  dst[0] = static_cast<uint8_t>(value & 0xFF);
+  dst[1] = static_cast<uint8_t>((value >> 8) & 0xFF);
+  dst[2] = static_cast<uint8_t>((value >> 16) & 0xFF);
+  dst[3] = static_cast<uint8_t>((value >> 24) & 0xFF);
+}
+
+static uint16_t readLe16(const uint8_t *src) {
+  return static_cast<uint16_t>(src[0]) | (static_cast<uint16_t>(src[1]) << 8);
+}
+
+static uint32_t readLe32(const uint8_t *src) {
+  return static_cast<uint32_t>(src[0]) | (static_cast<uint32_t>(src[1]) << 8) |
+         (static_cast<uint32_t>(src[2]) << 16) | (static_cast<uint32_t>(src[3]) << 24);
+}
+
+// Build the canonical 44-byte WAV/PCM header for the recorded mono buffer.
+// The PCM stays in recordingPcm; we only wrap a header so a later Wi-Fi step
+// can send header bytes followed by the PCM bytes without a second big buffer.
+static void buildWavHeader(uint8_t *dst, uint32_t pcmBytes) {
+  const uint32_t byteRate = SAMPLE_RATE * WAV_CHANNELS * (WAV_BITS_PER_SAMPLE / 8);
+  const uint16_t blockAlign = WAV_CHANNELS * (WAV_BITS_PER_SAMPLE / 8);
+
+  memcpy(dst + 0, "RIFF", 4);
+  writeLe32(dst + 4, 36 + pcmBytes);  // file size minus the 8-byte RIFF chunk descriptor
+  memcpy(dst + 8, "WAVE", 4);
+
+  memcpy(dst + 12, "fmt ", 4);
+  writeLe32(dst + 16, 16);  // PCM fmt chunk size
+  writeLe16(dst + 20, 1);   // audio format = PCM
+  writeLe16(dst + 22, WAV_CHANNELS);
+  writeLe32(dst + 24, SAMPLE_RATE);
+  writeLe32(dst + 28, byteRate);
+  writeLe16(dst + 32, blockAlign);
+  writeLe16(dst + 34, WAV_BITS_PER_SAMPLE);
+
+  memcpy(dst + 36, "data", 4);
+  writeLe32(dst + 40, pcmBytes);
+}
+
+// Read back the header and confirm every field matches the MVP contract.
+static bool validateWavHeader(const uint8_t *header, uint32_t pcmBytes) {
+  bool ok = true;
+  ok = ok && memcmp(header + 0, "RIFF", 4) == 0;
+  ok = ok && memcmp(header + 8, "WAVE", 4) == 0;
+  ok = ok && memcmp(header + 12, "fmt ", 4) == 0;
+  ok = ok && memcmp(header + 36, "data", 4) == 0;
+  ok = ok && readLe32(header + 4) == 36 + pcmBytes;
+  ok = ok && readLe32(header + 16) == 16;
+  ok = ok && readLe16(header + 20) == 1;
+  ok = ok && readLe16(header + 22) == WAV_CHANNELS;
+  ok = ok && readLe32(header + 24) == SAMPLE_RATE;
+  ok = ok && readLe16(header + 34) == WAV_BITS_PER_SAMPLE;
+  ok = ok && readLe32(header + 40) == pcmBytes;
+  return ok;
+}
+
+static void wrapRecordingAsWav() {
+  if (recordingPcm == nullptr || recordingSampleCount == 0) {
+    Serial.println("[wav] skipped: empty recording");
+    return;
+  }
+
+  const uint32_t pcmBytes = static_cast<uint32_t>(recordingSampleCount * sizeof(int16_t));
+  buildWavHeader(wavHeader, pcmBytes);
+  const bool valid = validateWavHeader(wavHeader, pcmBytes);
+  const uint32_t wavBytes = WAV_HEADER_SIZE + pcmBytes;
+
+  Serial.printf(
+      "[wav] bytes=%lu pcm_bytes=%lu sample_rate=%lu channels=%u bits=%u valid=%s\n",
+      static_cast<unsigned long>(wavBytes),
+      static_cast<unsigned long>(pcmBytes),
+      static_cast<unsigned long>(SAMPLE_RATE),
+      static_cast<unsigned int>(WAV_CHANNELS),
+      static_cast<unsigned int>(WAV_BITS_PER_SAMPLE),
+      valid ? "yes" : "no");
+}
+
 static bool readDebouncedButtonPressed() {
   const bool rawPressed = digitalRead(BUTTON_PIN) == LOW;
   const uint32_t now = millis();
@@ -470,6 +560,7 @@ void loop() {
     Serial.println("[button] released");
     stopMic();
     printRecordingSummary();
+    wrapRecordingAsWav();
     playRecordedAudio();
   }
 
