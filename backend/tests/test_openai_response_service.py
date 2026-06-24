@@ -120,6 +120,25 @@ def test_pipeline_calls_stt_chat_tts_and_returns_mvp_wav() -> None:
     assert info.frames > 0
 
 
+def test_multi_turn_includes_prior_history_in_chat() -> None:
+    from backend.app.services.conversation import ConversationMemory
+
+    memory = ConversationMemory(ttl_seconds=300)
+    service = OpenAIResponseService(_config(), client=_FakeOpenAIClient(reply="раз"), memory=memory)
+    service.generate_response_audio(make_sine_wav())  # first turn
+
+    second_client = _FakeOpenAIClient(transcript="а ещё?", reply="два")
+    service2 = OpenAIResponseService(_config(), client=second_client, memory=memory)
+    service2.generate_response_audio(make_sine_wav())
+
+    messages = second_client.calls["chat"]["messages"]
+    # system + prior (user/assistant) + new user
+    assert messages[0]["role"] == "system"
+    assert messages[1] == {"role": "user", "content": "Привет"}
+    assert messages[2] == {"role": "assistant", "content": "раз"}
+    assert messages[-1] == {"role": "user", "content": "а ещё?"}
+
+
 def test_resamples_tts_audio_to_16k() -> None:
     client = _FakeOpenAIClient(tts_wav=_make_wav(24_000, 480))
     service = OpenAIResponseService(_config(), client=client)

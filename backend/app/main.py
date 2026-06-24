@@ -16,10 +16,12 @@ configure_logging(config.log_level)
 # truncate/limit the reply, and they are easy to get wrong via a stale exported
 # env var that overrides .env. Logging them removes the guesswork.
 logging.getLogger("bnt.backend").info(
-    "[boot] max_response_bytes=%s max_response_duration_ms=%s response_timeout_ms=%s tts_voice=%s",
+    "[boot] max_response_bytes=%s max_response_duration_ms=%s response_timeout_ms=%s "
+    "conversation_ttl_ms=%s tts_voice=%s",
     config.max_response_bytes,
     config.max_response_duration_ms,
     config.response_timeout_ms,
+    config.conversation_ttl_ms,
     config.openai_tts_voice,
 )
 

@@ -23,6 +23,9 @@ class BackendConfig:
     audio_bits_per_sample: int = 16
     log_level: str = "info"
     response_timeout_ms: int = 30_000
+    # Multi-turn memory: keep dialogue context this long after the first message,
+    # then clear so the next message starts a fresh conversation. 0 disables it.
+    conversation_ttl_ms: int = 300_000  # 5 minutes
     openai_api_key: str | None = None
     openai_chat_model: str = DEFAULT_OPENAI_CHAT_MODEL
     openai_stt_model: str = DEFAULT_OPENAI_STT_MODEL
@@ -41,6 +44,7 @@ def load_config() -> BackendConfig:
         audio_bits_per_sample=int(os.getenv("BNT_AUDIO_BITS_PER_SAMPLE", "16")),
         log_level=os.getenv("BNT_LOG_LEVEL", "info"),
         response_timeout_ms=int(os.getenv("BNT_RESPONSE_TIMEOUT_MS", "30000")),
+        conversation_ttl_ms=int(os.getenv("BNT_CONVERSATION_TTL_MS", "300000")),
         openai_api_key=api_key,
         openai_chat_model=os.getenv("OPENAI_CHAT_MODEL", DEFAULT_OPENAI_CHAT_MODEL),
         openai_stt_model=os.getenv("OPENAI_STT_MODEL", DEFAULT_OPENAI_STT_MODEL),

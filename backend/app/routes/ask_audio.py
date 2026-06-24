@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse, Response
 
 from backend.app.audio.validation import validate_request_wav
 from backend.app.config import BackendConfig, load_config
+from backend.app.services.conversation import get_shared_memory
 from backend.app.services.fake_response_service import FakeResponseService
 from backend.app.services.openai_response_service import OpenAIResponseService
 from backend.app.services.response_service import ResponseService, ResponseServiceError
@@ -29,12 +30,14 @@ def get_response_service(config: BackendConfig = Depends(load_config)) -> Respon
     mode = (os.getenv("BNT_RESPONSE_SERVICE") or "").strip().lower()
     if mode == "fake":
         return FakeResponseService()
+    # Shared memory persists multi-turn context across requests (per-process).
+    memory = get_shared_memory(config.conversation_ttl_ms / 1000)
     if mode == "openai":
-        return OpenAIResponseService(config)
+        return OpenAIResponseService(config, memory=memory)
     # Auto: prefer OpenAI when a key is configured, otherwise fall back to the
     # stub so local development and tests work without credentials.
     if config.openai_api_key:
-        return OpenAIResponseService(config)
+        return OpenAIResponseService(config, memory=memory)
     return FakeResponseService()
 
 

@@ -10,6 +10,7 @@ import numpy as np
 from openai import APITimeoutError, OpenAIError
 
 from backend.app.config import BackendConfig
+from backend.app.services.conversation import ConversationMemory
 from backend.app.services.response_service import (
     ResponseServiceProviderError,
     ResponseServiceTimeout,
@@ -32,9 +33,17 @@ SYSTEM_PROMPT = (
 class OpenAIResponseService:
     """Turn an input WAV into an MVP-format WAV reply via OpenAI STT -> chat -> TTS."""
 
-    def __init__(self, config: BackendConfig, client: object | None = None) -> None:
+    def __init__(
+        self,
+        config: BackendConfig,
+        client: object | None = None,
+        memory: ConversationMemory | None = None,
+    ) -> None:
         self._config = config
         self._client = client if client is not None else self._build_client(config)
+        # Default to a private (per-instance) memory; the route injects a shared
+        # one so context persists across requests.
+        self._memory = memory if memory is not None else ConversationMemory(config.conversation_ttl_ms / 1000)
 
     @staticmethod
     def _build_client(config: BackendConfig) -> object:
@@ -51,7 +60,8 @@ class OpenAIResponseService:
         started = time.monotonic()
         try:
             transcript = self._transcribe(input_wav_bytes)
-            reply_text = self._chat(transcript)
+            history = self._memory.history()
+            reply_text = self._chat(transcript, history)
             tts_audio = self._synthesize(reply_text)
         except APITimeoutError as exc:
             self._log(request_id, started, "timeout")
@@ -61,6 +71,8 @@ class OpenAIResponseService:
             raise ResponseServiceProviderError() from exc
 
         wav_bytes = self._to_mvp_wav(tts_audio)
+        # Remember the turn only after the full response succeeded.
+        self._memory.record(transcript, reply_text)
         self._log(request_id, started, "ok")
         return wav_bytes
 
@@ -73,13 +85,13 @@ class OpenAIResponseService:
         )
         return (getattr(result, "text", "") or "").strip()
 
-    def _chat(self, transcript: str) -> str:
+    def _chat(self, transcript: str, history: list[dict[str, str]]) -> str:
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages.extend(history)
+        messages.append({"role": "user", "content": transcript})
         completion = self._client.chat.completions.create(
             model=self._config.openai_chat_model,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": transcript},
-            ],
+            messages=messages,
         )
         return (completion.choices[0].message.content or "").strip()
 
