@@ -21,8 +21,8 @@ static constexpr i2s_port_t I2S_PORT = I2S_NUM_0;
 static constexpr uint32_t SAMPLE_RATE = 16000;
 static constexpr uint32_t DEBOUNCE_MS = 30;
 static constexpr uint32_t VOLUME_LOG_INTERVAL_MS = 120;
-static constexpr uint32_t BEEP_DURATION_MS = 90;
-static constexpr float BEEP_GAIN = 0.18f;
+static constexpr uint32_t BEEP_DURATION_MS = 160;
+static constexpr float BEEP_GAIN = 0.28f;
 static constexpr uint32_t REC_START_FREQ_HZ = 988;  // rising cue: recording started
 static constexpr uint32_t REC_END_FREQ_HZ = 587;    // lower cue: recording stopped
 // Quiet periodic "thinking" blip while waiting for the backend response.
@@ -32,6 +32,10 @@ static constexpr float THINKING_GAIN = 0.05f;
 static constexpr uint32_t THINKING_INTERVAL_MS = 700;
 static constexpr int32_t MIC_GAIN = 3;
 static constexpr float PLAYBACK_GAIN = 1.5f;  // a bit louder (was 1.0; 2.0 clipped)
+// Time to let the speaker I2S DMA drain to the DAC before muting. Must exceed
+// the TX DMA depth (16 * 256), otherwise queued audio (a short cue, or the tail
+// of a response) is cut off if we zero/stop the buffer too soon.
+static constexpr uint32_t SPEAKER_DRAIN_MS = 250;
 // Stereo frames read per i2s_read and streamed as one HTTP chunk. Larger =
 // fewer, bigger socket writes (closer to one TCP segment) — better on weak Wi-Fi.
 static constexpr size_t MIC_READ_FRAMES = 512;
@@ -266,10 +270,12 @@ static void playCue(uint32_t freqHz) {
   startSpeakerI2S();
   setAmpEnabled(true);
   delay(8);
+  // Pre-roll silence so the MAX98357 finishes its soft-unmute ramp BEFORE the
+  // tone — otherwise a short cue is swallowed by the unmute and barely audible.
+  writeSpeakerSilence(60);
   writeToneToI2S(freqHz, BEEP_DURATION_MS, BEEP_GAIN);
   writeSpeakerSilence(30);
-  i2s_zero_dma_buffer(I2S_PORT);
-  delay(10);
+  delay(SPEAKER_DRAIN_MS);  // let the DMA play out — do NOT zero it (that drops the cue)
   setAmpEnabled(false);
   delay(10);
   stopI2S();
@@ -614,8 +620,7 @@ static size_t streamResponseToSpeaker(WiFiClient &client, long contentLength) {
   }
 
   writeSpeakerSilence(40);
-  i2s_zero_dma_buffer(I2S_PORT);
-  delay(10);
+  delay(SPEAKER_DRAIN_MS);  // let the DMA play out the response tail before muting
   setAmpEnabled(false);
   delay(10);
   stopI2S();
