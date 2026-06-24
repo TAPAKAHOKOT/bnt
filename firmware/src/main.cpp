@@ -31,7 +31,7 @@ static constexpr uint32_t THINKING_BLIP_MS = 60;
 static constexpr float THINKING_GAIN = 0.05f;
 static constexpr uint32_t THINKING_INTERVAL_MS = 700;
 static constexpr int32_t MIC_GAIN = 3;
-static constexpr float PLAYBACK_GAIN = 1.5f;  // a bit louder (was 1.0; 2.0 clipped)
+static constexpr float PLAYBACK_GAIN = 2.0f;  // louder; loud TTS passages may clip slightly
 // Time to let the speaker I2S DMA drain to the DAC before muting. Must exceed
 // the TX DMA depth (16 * 256), otherwise queued audio (a short cue, or the tail
 // of a response) is cut off if we zero/stop the buffer too soon.
