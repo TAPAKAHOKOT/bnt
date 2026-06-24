@@ -146,10 +146,10 @@ Two constants control loudness/sensitivity in `src/main.cpp`:
 
 ```cpp
 static constexpr int32_t MIC_GAIN = 3;
-static constexpr float PLAYBACK_GAIN = 2.0f;
+static constexpr float PLAYBACK_GAIN = 1.5f;
 ```
 
 `MIC_GAIN` amplifies microphone samples before streaming them up.
 `PLAYBACK_GAIN` amplifies the response PCM before the MAX98357. Output is clipped
-to signed 16-bit, so very loud TTS passages may distort slightly at higher gain;
-lower it toward `1.5` if you hear hiss/clipping.
+to signed 16-bit, so very loud TTS passages may distort at higher gain; `2.0`
+was audibly worse, `1.5` stays mostly clean.
