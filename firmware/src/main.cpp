@@ -21,8 +21,15 @@ static constexpr i2s_port_t I2S_PORT = I2S_NUM_0;
 static constexpr uint32_t SAMPLE_RATE = 16000;
 static constexpr uint32_t DEBOUNCE_MS = 30;
 static constexpr uint32_t VOLUME_LOG_INTERVAL_MS = 120;
-static constexpr uint32_t MAX_RECORDING_MS = 6000;
-static constexpr size_t MAX_RECORDING_SAMPLES = SAMPLE_RATE * MAX_RECORDING_MS / 1000;
+// Recording buffer is allocated adaptively at boot: we try TARGET_RECORDING_MS
+// and step down by RECORDING_STEP_MS until a single contiguous block fits AND
+// enough heap is left for the Wi-Fi stack. The ESP32 heap is split into regions,
+// so the largest contiguous block (~110-150 KB) is the real limit, not free_heap.
+static constexpr uint32_t TARGET_RECORDING_MS = 6000;
+static constexpr uint32_t MIN_RECORDING_MS = 2000;
+static constexpr uint32_t RECORDING_STEP_MS = 500;
+static constexpr size_t MIN_FREE_HEAP_AFTER_ALLOC = 120000;  // reserve for Wi-Fi + runtime
+static size_t recordingCapacitySamples = 0;                  // set at boot by allocateRecordingBuffer()
 static constexpr uint32_t BEEP_DURATION_MS = 90;
 static constexpr uint32_t BEEP_FREQ_HZ = 880;
 static constexpr float BEEP_GAIN = 0.18f;
@@ -347,7 +354,7 @@ static RecordingStats readAndRecordMicChunk() {
   size_t appended = 0;
 
   for (size_t i = useSlot1 ? 1 : 0; i < sampleCount; i += 2) {
-    if (recordingSampleCount >= MAX_RECORDING_SAMPLES) {
+    if (recordingSampleCount >= recordingCapacitySamples) {
       recordingOverflow = true;
       break;
     }
@@ -679,7 +686,7 @@ static bool sendWavToBackend() {
   // byte copy yields valid int16 samples. Capped to the record buffer size.
   uint8_t head[WAV_HEADER_SIZE] = {};
   uint8_t *pcmDst = reinterpret_cast<uint8_t *>(recordingPcm);
-  const size_t pcmCap = MAX_RECORDING_SAMPLES * sizeof(int16_t);
+  const size_t pcmCap = recordingCapacitySamples * sizeof(int16_t);
   size_t bodyBytes = 0;
   size_t pcmStored = 0;
   bool responseTruncated = false;
@@ -808,10 +815,23 @@ void setup() {
   Serial.flush();
   delay(250);
 
-  recordingPcm = static_cast<int16_t *>(malloc(MAX_RECORDING_SAMPLES * sizeof(int16_t)));
+  // Adaptive allocation: largest contiguous block that fits and still leaves
+  // heap for Wi-Fi. The ESP32 heap can't give one 192 KB block even with 300 KB
+  // free, so we step the target down until malloc succeeds.
+  for (uint32_t ms = TARGET_RECORDING_MS; ms >= MIN_RECORDING_MS; ms -= RECORDING_STEP_MS) {
+    const size_t samples = SAMPLE_RATE * ms / 1000;
+    int16_t *candidate = static_cast<int16_t *>(malloc(samples * sizeof(int16_t)));
+    if (candidate != nullptr && ESP.getFreeHeap() >= MIN_FREE_HEAP_AFTER_ALLOC) {
+      recordingPcm = candidate;
+      recordingCapacitySamples = samples;
+      break;
+    }
+    free(candidate);  // free(nullptr) is a no-op
+  }
   Serial.printf(
-      "[boot] recording buffer bytes=%u allocated=%s free_heap=%lu\n",
-      static_cast<unsigned int>(MAX_RECORDING_SAMPLES * sizeof(int16_t)),
+      "[boot] recording buffer bytes=%u ms=%u allocated=%s free_heap=%lu\n",
+      static_cast<unsigned int>(recordingCapacitySamples * sizeof(int16_t)),
+      static_cast<unsigned int>(recordingCapacitySamples * 1000 / SAMPLE_RATE),
       recordingPcm == nullptr ? "no" : "yes",
       static_cast<unsigned long>(ESP.getFreeHeap()));
 

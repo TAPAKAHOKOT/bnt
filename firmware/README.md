@@ -131,15 +131,20 @@ For INMP441 debugging:
 - `bytes>0` and both slots stay `0` means clocks are running but the mic data slot is silent; recheck INMP441 `VDD`, `GND`, `SD -> GPIO33`, and `L/R -> GND`.
 - If either `slot0` or `slot1` changes with voice, the microphone path is working.
 
-The recording buffer is bounded to 6 seconds at 16 kHz mono 16-bit PCM:
+The recording buffer is allocated adaptively at boot (16 kHz mono 16-bit PCM).
+The firmware targets 6 seconds and steps down by 0.5 s until a single
+contiguous block fits AND enough heap is left for the Wi-Fi stack:
 
 ```text
-max bytes = 192000
+[boot] recording buffer bytes=... ms=... allocated=yes free_heap=...
 ```
 
-This single buffer is reused for the backend response, so it also caps response
-playback to 6 seconds. The size is limited by internal ESP32 RAM (a larger
-buffer would starve the Wi-Fi stack); this board has no PSRAM to grow it.
+The real ceiling is the largest contiguous heap block (~110-150 KB ≈ 3.5-4.5 s),
+not total free memory — the ESP32 heap is split into regions, so a single 192 KB
+(6 s) block does not exist even with ~300 KB free. This board has no PSRAM to
+grow it. The same buffer is reused for the backend response, so the actual
+allocated duration also caps response playback. If allocation fails entirely,
+recording is skipped safely instead of crashing.
 
 If `overflow=yes`, the button was held longer than the current RAM recording limit.
 Playback uses the recorded mono PCM buffer and duplicates it to both MAX98357 I2S output channels.
