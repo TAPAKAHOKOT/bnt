@@ -5,16 +5,26 @@ Minimal ESP32 hardware loop for the confirmed breadboard wiring.
 Flow:
 
 ```text
-pressed -> beep -> record PCM while held -> released -> wrap WAV
-        -> POST /ask-audio -> play backend response (fallback: local recording)
+pressed -> beep -> open chunked upload -> stream mic PCM while held
+        -> released -> finish upload -> stream backend response to speaker
 ```
 
-At boot the firmware joins the local Wi-Fi, then on each press streams the
-recorded WAV to the backend's `POST /ask-audio` and plays the WAV it returns.
-No OpenAI key, file recording, or TTS lives in firmware — only the Wi-Fi
-credentials and backend URL. Both Wi-Fi and the request are non-fatal: if
-either fails, the device falls back to playing the local recording so the
-hardware loop still works offline (`[audio_out] source=local_recording`).
+At boot the firmware joins the local Wi-Fi. On press it opens a chunked HTTP
+upload to `POST /ask-audio` and **streams the microphone PCM as it is captured**
+(`Content-Type: audio/L16`), so recording length is **not** bounded by RAM — no
+audio buffer is allocated on the device. On release it finishes the upload and
+**streams the backend's WAV response straight to the speaker** as it downloads,
+so the response length is not RAM-bound either. No OpenAI key, file recording,
+or TTS lives in firmware — only Wi-Fi credentials and the backend URL.
+
+If Wi-Fi/upload fails, recording still runs for mic debugging but nothing is
+played (`[audio_out] no response (upload failed or offline)`); there is no
+offline playback fallback, since the backend is required for any answer.
+
+Trade-off: capture and the socket write share one loop, so on a weak Wi-Fi link
+a stalled write can drop some mic samples (Whisper tolerates minor glitches).
+The RX DMA cushion (~128 ms), `setNoDelay`, and coalesced ~1 KB chunks mitigate
+this; a dedicated TX task/ring buffer would remove it entirely if needed.
 
 ## Wi-Fi / backend config
 
@@ -95,64 +105,35 @@ BNT_SERIAL_OK baud=115200
 [button] pressed
 [audio_out] beep
 [audio_in] mic start
-[recording] ms=... bytes=... samples=... volume=... slot0=... slot1=... read_bytes=... appended=... overflow=no
+[network] upload started (chunked) url=http://.../ask-audio
+[recording] ms=... bytes=... samples=... volume=... slot0=... slot1=... read_bytes=... streamed=...
 [button] released
 [audio_in] mic stop
-[recording] done duration_ms=... bytes=... samples=... peak=... rms=... checksum=... overflow=no
-[wav] bytes=... pcm_bytes=... sample_rate=16000 channels=1 bits=16 valid=yes
-[network] POST started bytes=... url=http://.../ask-audio
-[network] status=200 latency_ms=... content_length=... text=...
+[recording] done duration_ms=... bytes=... samples=... peak=... rms=...
+[network] status=200 content_length=... text=...
 [audio_out] source=backend_response (streamed)
 [audio_out] streamed samples=...
 ```
 
-`[audio_out] source=` shows whether playback is the streamed `backend_response`
-(a 200 with a valid WAV header) or `local_recording` (any network failure →
-offline fallback). The response is streamed to the speaker as it downloads, so
-its length is not bounded by RAM.
+Neither recording nor playback is buffered in full: the mic PCM is streamed up
+as it is captured, and the response is streamed to the speaker as it downloads,
+so neither length is bounded by RAM. On any network failure nothing is played
+(`[audio_out] no response (upload failed or offline)`) — there is no offline
+playback fallback.
 
-After each recording the firmware wraps the captured PCM in a canonical
-44-byte WAV/PCM header (built in RAM, PCM left in place) and validates every
-field against the MVP wire contract:
+For INMP441 debugging (the `[recording]` lines still report mic levels even when
+offline):
 
-- `RIFF`/`WAVE`/`fmt `/`data` chunk markers present
-- mono (`channels=1`), `16000` Hz, `16`-bit PCM
-- header `data` size equals the recorded PCM byte count
-- `bytes` = 44-byte header + `pcm_bytes`
-
-`valid=yes` confirms the header parses against the recorded PCM. No Wi-Fi,
-backend, or file write is involved yet; this only proves the WAV shape in RAM.
-
-For INMP441 debugging:
-
-- `bytes=0` means ESP32 is not receiving I2S samples from the driver.
-- `bytes>0` and both slots stay `0` means clocks are running but the mic data slot is silent; recheck INMP441 `VDD`, `GND`, `SD -> GPIO33`, and `L/R -> GND`.
+- `read_bytes=0` means ESP32 is not receiving I2S samples from the driver.
+- `read_bytes>0` and both slots stay `0` means clocks are running but the mic data slot is silent; recheck INMP441 `VDD`, `GND`, `SD -> GPIO33`, and `L/R -> GND`.
 - If either `slot0` or `slot1` changes with voice, the microphone path is working.
 
-The recording buffer is allocated adaptively at boot (16 kHz mono 16-bit PCM).
-The firmware targets 6 seconds and steps down by 0.5 s until a single
-contiguous block fits AND enough heap is left for the Wi-Fi stack:
-
-```text
-[boot] recording buffer bytes=... ms=... allocated=yes free_heap=...
-```
-
-The real ceiling is the largest contiguous heap block (~110-150 KB ≈ 3.5-4.5 s),
-not total free memory — the ESP32 heap is split into regions, so a single 192 KB
-(6 s) block does not exist even with ~300 KB free. This board has no PSRAM to
-grow it. This buffer caps the **recording** length only. If allocation fails
-entirely, recording is skipped safely instead of crashing.
-
-The **backend response is streamed** straight to the speaker as it downloads
-(see `streamResponseToSpeaker`), so response length is **not** capped by RAM —
-no full-clip buffer is allocated for playback. The enlarged I2S TX DMA buffers
-provide the jitter cushion; on a weak Wi-Fi link a slow chunk can cause a brief
-audible underrun. If the request fails (no Wi-Fi, non-200, bad header) nothing
-is streamed and the device falls back to playing the local recording
-(`[audio_out] source=local_recording`).
-
-If `overflow=yes`, the button was held longer than the current RAM recording limit.
-Playback uses the recorded mono PCM buffer and duplicates it to both MAX98357 I2S output channels.
+The response is streamed to the speaker as it downloads (see
+`streamResponseToSpeaker`); the enlarged I2S TX DMA buffers provide the jitter
+cushion, so on a weak Wi-Fi link a slow chunk can cause a brief audible
+underrun. The mic upload shares the capture loop, so a stalled socket write can
+also drop some mic samples on weak Wi-Fi (mitigated by a ~128 ms RX DMA cushion,
+`setNoDelay`, and coalesced ~1 KB chunks).
 
 ## Gain
 

@@ -21,20 +21,14 @@ static constexpr i2s_port_t I2S_PORT = I2S_NUM_0;
 static constexpr uint32_t SAMPLE_RATE = 16000;
 static constexpr uint32_t DEBOUNCE_MS = 30;
 static constexpr uint32_t VOLUME_LOG_INTERVAL_MS = 120;
-// Recording buffer is allocated adaptively at boot: we try TARGET_RECORDING_MS
-// and step down by RECORDING_STEP_MS until a single contiguous block fits AND
-// enough heap is left for the Wi-Fi stack. The ESP32 heap is split into regions,
-// so the largest contiguous block (~110-150 KB) is the real limit, not free_heap.
-static constexpr uint32_t TARGET_RECORDING_MS = 6000;
-static constexpr uint32_t MIN_RECORDING_MS = 2000;
-static constexpr uint32_t RECORDING_STEP_MS = 500;
-static constexpr size_t MIN_FREE_HEAP_AFTER_ALLOC = 120000;  // reserve for Wi-Fi + runtime
-static size_t recordingCapacitySamples = 0;                  // set at boot by allocateRecordingBuffer()
 static constexpr uint32_t BEEP_DURATION_MS = 90;
 static constexpr uint32_t BEEP_FREQ_HZ = 880;
 static constexpr float BEEP_GAIN = 0.18f;
 static constexpr int32_t MIC_GAIN = 3;
 static constexpr int32_t PLAYBACK_GAIN = 1;
+// Stereo frames read per i2s_read and streamed as one HTTP chunk. Larger =
+// fewer, bigger socket writes (closer to one TCP segment) — better on weak Wi-Fi.
+static constexpr size_t MIC_READ_FRAMES = 512;
 
 static constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
 static constexpr uint32_t HTTP_TIMEOUT_MS = 10000;
@@ -73,13 +67,14 @@ struct RecordingStats {
   size_t samplesAppended;
 };
 
-static int16_t *recordingPcm = nullptr;
-static uint8_t wavHeader[WAV_HEADER_SIZE];
-static size_t recordingSampleCount = 0;
+// Recording is streamed to the backend over a chunked HTTP upload while the
+// button is held — no audio buffer is kept, so recording length is unbounded.
+static WiFiClient uploadClient;
+static bool uploadActive = false;
+static size_t recordingSampleCount = 0;  // total samples streamed (for stats/logs)
 static uint32_t recordingStartedAt = 0;
 static uint32_t recordingPeak = 0;
 static uint64_t recordingSumSquares = 0;
-static bool recordingOverflow = false;
 
 static uint32_t minU32(uint32_t a, uint32_t b) {
   return a < b ? a : b;
@@ -155,7 +150,7 @@ static void startMicI2S() {
   config.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
   config.communication_format = I2S_COMM_FORMAT;
   config.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
-  config.dma_buf_count = 4;
+  config.dma_buf_count = 16;  // ~128 ms RX cushion: socket writes can stall while streaming
   config.dma_buf_len = 256;
   config.use_apll = false;
   config.tx_desc_auto_clear = false;
@@ -191,18 +186,38 @@ static void stopMic() {
   Serial.println("[audio_in] mic stop");
 }
 
-static void resetRecordingBuffer() {
-  if (recordingPcm == nullptr) {
-    Serial.println("[recording] cannot start: buffer allocation failed");
-    recordingOverflow = true;
-    return;
-  }
-
+static void resetRecordingStats() {
   recordingSampleCount = 0;
   recordingStartedAt = millis();
   recordingPeak = 0;
   recordingSumSquares = 0;
-  recordingOverflow = false;
+}
+
+// Write one HTTP/1.1 chunk: "<hexlen>\r\n<bytes>\r\n". The framing and payload
+// are coalesced into a single buffer so they go out as one TCP write (one
+// segment with Nagle disabled) instead of three tiny writes. Returns false if
+// the socket write fails (connection dropped) so the caller can stop streaming.
+static bool writeHttpChunk(const uint8_t *data, size_t len) {
+  static uint8_t frame[MIC_READ_FRAMES * sizeof(int16_t) + 16];
+  if (len > MIC_READ_FRAMES * sizeof(int16_t)) {
+    return false;  // should never happen; guards the static buffer
+  }
+  const int hdr = snprintf(reinterpret_cast<char *>(frame), 12, "%X\r\n", static_cast<unsigned int>(len));
+  size_t total = static_cast<size_t>(hdr);
+  memcpy(frame + total, data, len);
+  total += len;
+  frame[total++] = '\r';
+  frame[total++] = '\n';
+
+  size_t sent = 0;
+  while (sent < total) {
+    const size_t wrote = uploadClient.write(frame + sent, total - sent);
+    if (wrote == 0) {
+      return false;
+    }
+    sent += wrote;
+  }
+  return true;
 }
 
 static void writeSpeakerSilence(uint32_t durationMs) {
@@ -253,53 +268,6 @@ static void playBeep() {
   silenceSpeakerPins();
 }
 
-static void playRecordedAudio() {
-  if (recordingSampleCount == 0) {
-    Serial.println("[audio_out] playback skipped: empty recording");
-    return;
-  }
-
-  Serial.printf(
-      "[audio_out] playback start bytes=%u samples=%u\n",
-      static_cast<unsigned int>(recordingSampleCount * sizeof(int16_t)),
-      static_cast<unsigned int>(recordingSampleCount));
-
-  startSpeakerI2S();
-  setAmpEnabled(true);
-  delay(8);
-
-  int16_t stereoBuffer[128 * 2];
-  size_t played = 0;
-
-  while (played < recordingSampleCount) {
-    const uint32_t count = minU32(128, static_cast<uint32_t>(recordingSampleCount - played));
-
-    for (uint32_t i = 0; i < count; ++i) {
-      int32_t amplified = static_cast<int32_t>(recordingPcm[played + i]) * PLAYBACK_GAIN;
-      if (amplified > 32767) {
-        amplified = 32767;
-      } else if (amplified < -32768) {
-        amplified = -32768;
-      }
-      const int16_t sample = static_cast<int16_t>(amplified);
-      stereoBuffer[i * 2] = sample;
-      stereoBuffer[i * 2 + 1] = sample;
-    }
-
-    size_t bytesWritten = 0;
-    i2s_write(I2S_PORT, stereoBuffer, count * 2 * sizeof(int16_t), &bytesWritten, portMAX_DELAY);
-    played += count;
-  }
-
-  writeSpeakerSilence(40);
-  i2s_zero_dma_buffer(I2S_PORT);
-  delay(10);
-  setAmpEnabled(false);
-  delay(10);
-  stopI2S();
-  silenceSpeakerPins();
-  Serial.println("[audio_out] playback done");
-}
 
 static uint32_t absShiftedSample(int32_t sample) {
   sample >>= 14;
@@ -332,7 +300,8 @@ static void updateRecordingStats(int16_t sample) {
 }
 
 static RecordingStats readAndRecordMicChunk() {
-  int32_t samples[256 * 2];
+  // Static (file-scope) to keep the loop-task stack small.
+  static int32_t samples[MIC_READ_FRAMES * 2];
   size_t bytesRead = 0;
 
   esp_err_t result = i2s_read(I2S_PORT, samples, sizeof(samples), &bytesRead, pdMS_TO_TICKS(20));
@@ -357,25 +326,30 @@ static RecordingStats readAndRecordMicChunk() {
   }
 
   const bool useSlot1 = slot1Sum > slot0Sum;
-  size_t appended = 0;
+  static int16_t pcmChunk[MIC_READ_FRAMES];
+  size_t produced = 0;
 
-  for (size_t i = useSlot1 ? 1 : 0; i < sampleCount; i += 2) {
-    if (recordingSampleCount >= recordingCapacitySamples) {
-      recordingOverflow = true;
-      break;
-    }
-
+  for (size_t i = useSlot1 ? 1 : 0; i < sampleCount && produced < MIC_READ_FRAMES; i += 2) {
     const int16_t pcm = toPcm16(samples[i]);
-    recordingPcm[recordingSampleCount++] = pcm;
+    pcmChunk[produced++] = pcm;
     updateRecordingStats(pcm);
-    appended++;
+    recordingSampleCount++;
+  }
+
+  // Stream this chunk to the backend. If the socket breaks, stop streaming but
+  // keep reading the mic (so stats/logs still work for the rest of the hold).
+  if (uploadActive && produced > 0) {
+    if (!writeHttpChunk(reinterpret_cast<const uint8_t *>(pcmChunk), produced * sizeof(int16_t))) {
+      Serial.println("[network] upload chunk write failed, aborting stream");
+      uploadActive = false;
+    }
   }
 
   return {
       slot0Count == 0 ? 0 : static_cast<uint32_t>(slot0Sum / slot0Count),
       slot1Count == 0 ? 0 : static_cast<uint32_t>(slot1Sum / slot1Count),
       bytesRead,
-      appended,
+      produced,
   };
 }
 
@@ -390,7 +364,7 @@ static void recordMicWhileHeld() {
   const uint32_t activeVolume = stats.slot0Volume > stats.slot1Volume ? stats.slot0Volume : stats.slot1Volume;
   const uint32_t durationMs = recordingStartedAt == 0 ? 0 : millis() - recordingStartedAt;
   Serial.printf(
-      "[recording] ms=%lu bytes=%u samples=%u volume=%lu slot0=%lu slot1=%lu read_bytes=%u appended=%u overflow=%s\n",
+      "[recording] ms=%lu bytes=%u samples=%u volume=%lu slot0=%lu slot1=%lu read_bytes=%u streamed=%u\n",
       static_cast<unsigned long>(durationMs),
       static_cast<unsigned int>(recordingSampleCount * sizeof(int16_t)),
       static_cast<unsigned int>(recordingSampleCount),
@@ -398,46 +372,22 @@ static void recordMicWhileHeld() {
       static_cast<unsigned long>(stats.slot0Volume),
       static_cast<unsigned long>(stats.slot1Volume),
       static_cast<unsigned int>(stats.bytesRead),
-      static_cast<unsigned int>(stats.samplesAppended),
-      recordingOverflow ? "yes" : "no");
+      static_cast<unsigned int>(stats.samplesAppended));
 }
 
 static void printRecordingSummary() {
   const uint32_t durationMs = recordingStartedAt == 0 ? 0 : millis() - recordingStartedAt;
-  uint32_t checksum = 2166136261UL;
-
-  if (recordingPcm != nullptr) {
-    for (size_t i = 0; i < recordingSampleCount; ++i) {
-      checksum ^= static_cast<uint16_t>(recordingPcm[i]);
-      checksum *= 16777619UL;
-    }
-  }
-
   const uint32_t rms = recordingSampleCount == 0
                            ? 0
                            : static_cast<uint32_t>(sqrt(static_cast<double>(recordingSumSquares) / recordingSampleCount));
 
   Serial.printf(
-      "[recording] done duration_ms=%lu bytes=%u samples=%u peak=%lu rms=%lu checksum=%08lx overflow=%s\n",
+      "[recording] done duration_ms=%lu bytes=%u samples=%u peak=%lu rms=%lu\n",
       static_cast<unsigned long>(durationMs),
       static_cast<unsigned int>(recordingSampleCount * sizeof(int16_t)),
       static_cast<unsigned int>(recordingSampleCount),
       static_cast<unsigned long>(recordingPeak),
-      static_cast<unsigned long>(rms),
-      static_cast<unsigned long>(checksum),
-      recordingOverflow ? "yes" : "no");
-}
-
-static void writeLe16(uint8_t *dst, uint16_t value) {
-  dst[0] = static_cast<uint8_t>(value & 0xFF);
-  dst[1] = static_cast<uint8_t>((value >> 8) & 0xFF);
-}
-
-static void writeLe32(uint8_t *dst, uint32_t value) {
-  dst[0] = static_cast<uint8_t>(value & 0xFF);
-  dst[1] = static_cast<uint8_t>((value >> 8) & 0xFF);
-  dst[2] = static_cast<uint8_t>((value >> 16) & 0xFF);
-  dst[3] = static_cast<uint8_t>((value >> 24) & 0xFF);
+      static_cast<unsigned long>(rms));
 }
 
 static uint16_t readLe16(const uint8_t *src) {
@@ -447,68 +397,6 @@ static uint16_t readLe16(const uint8_t *src) {
 static uint32_t readLe32(const uint8_t *src) {
   return static_cast<uint32_t>(src[0]) | (static_cast<uint32_t>(src[1]) << 8) |
          (static_cast<uint32_t>(src[2]) << 16) | (static_cast<uint32_t>(src[3]) << 24);
-}
-
-// Build the canonical 44-byte WAV/PCM header for the recorded mono buffer.
-// The PCM stays in recordingPcm; we only wrap a header so a later Wi-Fi step
-// can send header bytes followed by the PCM bytes without a second big buffer.
-static void buildWavHeader(uint8_t *dst, uint32_t pcmBytes) {
-  const uint32_t byteRate = SAMPLE_RATE * WAV_CHANNELS * (WAV_BITS_PER_SAMPLE / 8);
-  const uint16_t blockAlign = WAV_CHANNELS * (WAV_BITS_PER_SAMPLE / 8);
-
-  memcpy(dst + 0, "RIFF", 4);
-  writeLe32(dst + 4, 36 + pcmBytes);  // file size minus the 8-byte RIFF chunk descriptor
-  memcpy(dst + 8, "WAVE", 4);
-
-  memcpy(dst + 12, "fmt ", 4);
-  writeLe32(dst + 16, 16);  // PCM fmt chunk size
-  writeLe16(dst + 20, 1);   // audio format = PCM
-  writeLe16(dst + 22, WAV_CHANNELS);
-  writeLe32(dst + 24, SAMPLE_RATE);
-  writeLe32(dst + 28, byteRate);
-  writeLe16(dst + 32, blockAlign);
-  writeLe16(dst + 34, WAV_BITS_PER_SAMPLE);
-
-  memcpy(dst + 36, "data", 4);
-  writeLe32(dst + 40, pcmBytes);
-}
-
-// Read back the header and confirm every field matches the MVP contract.
-static bool validateWavHeader(const uint8_t *header, uint32_t pcmBytes) {
-  bool ok = true;
-  ok = ok && memcmp(header + 0, "RIFF", 4) == 0;
-  ok = ok && memcmp(header + 8, "WAVE", 4) == 0;
-  ok = ok && memcmp(header + 12, "fmt ", 4) == 0;
-  ok = ok && memcmp(header + 36, "data", 4) == 0;
-  ok = ok && readLe32(header + 4) == 36 + pcmBytes;
-  ok = ok && readLe32(header + 16) == 16;
-  ok = ok && readLe16(header + 20) == 1;
-  ok = ok && readLe16(header + 22) == WAV_CHANNELS;
-  ok = ok && readLe32(header + 24) == SAMPLE_RATE;
-  ok = ok && readLe16(header + 34) == WAV_BITS_PER_SAMPLE;
-  ok = ok && readLe32(header + 40) == pcmBytes;
-  return ok;
-}
-
-static void wrapRecordingAsWav() {
-  if (recordingPcm == nullptr || recordingSampleCount == 0) {
-    Serial.println("[wav] skipped: empty recording");
-    return;
-  }
-
-  const uint32_t pcmBytes = static_cast<uint32_t>(recordingSampleCount * sizeof(int16_t));
-  buildWavHeader(wavHeader, pcmBytes);
-  const bool valid = validateWavHeader(wavHeader, pcmBytes);
-  const uint32_t wavBytes = WAV_HEADER_SIZE + pcmBytes;
-
-  Serial.printf(
-      "[wav] bytes=%lu pcm_bytes=%lu sample_rate=%lu channels=%u bits=%u valid=%s\n",
-      static_cast<unsigned long>(wavBytes),
-      static_cast<unsigned long>(pcmBytes),
-      static_cast<unsigned long>(SAMPLE_RATE),
-      static_cast<unsigned int>(WAV_CHANNELS),
-      static_cast<unsigned int>(WAV_BITS_PER_SAMPLE),
-      valid ? "yes" : "no");
 }
 
 // Validate the backend's WAV response against the MVP contract. We require the
@@ -727,22 +615,14 @@ static size_t streamResponseToSpeaker(WiFiClient &client, long contentLength) {
   return samplesPlayed;
 }
 
-// Steps 2-3 of the firmware/backend bridge: stream the in-RAM WAV (header +
-// PCM) to the backend over a raw socket — header first, then PCM in chunks
-// straight from the record buffer (no second large contiguous buffer). On a 200
-// response the WAV body is streamed straight to the speaker (see
-// streamResponseToSpeaker), so response length is not capped by RAM. On any
-// failure nothing is played and the caller falls back to the local recording.
-// Failure is non-fatal.
-//
-// Returns true if the backend response was streamed to the speaker.
-static bool sendWavToBackend() {
+// Open a chunked HTTP upload to the backend and send the request headers. The
+// recorded PCM is streamed as raw audio/L16 chunks while the button is held
+// (writeHttpChunk), so recording length is never bounded by RAM. Sets
+// uploadActive on success. Failure is non-fatal (mic still runs for debugging).
+static bool beginUpload() {
+  uploadActive = false;
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[network] skipped: wifi not connected");
-    return false;
-  }
-  if (recordingPcm == nullptr || recordingSampleCount == 0) {
-    Serial.println("[network] skipped: empty recording");
+    Serial.println("[network] upload skipped: wifi not connected");
     return false;
   }
 
@@ -750,52 +630,44 @@ static bool sendWavToBackend() {
   char path[96];
   uint16_t port = 0;
   if (!parseBackendUrl(host, sizeof(host), &port, path, sizeof(path))) {
-    Serial.println("[network] skipped: bad backend url");
+    Serial.println("[network] upload skipped: bad backend url");
     return false;
   }
 
-  const size_t pcmBytes = recordingSampleCount * sizeof(int16_t);
-  const size_t wavBytes = WAV_HEADER_SIZE + pcmBytes;
-
-  WiFiClient client;
-  const uint32_t startedAt = millis();
-  if (!client.connect(host, port, HTTP_TIMEOUT_MS)) {
+  if (!uploadClient.connect(host, port, HTTP_TIMEOUT_MS)) {
     Serial.printf("[network] connect failed host=%s port=%u\n", host, static_cast<unsigned int>(port));
     return false;
   }
   // setTimeout is in seconds on the ESP32 Client; cover the slow OpenAI pipeline.
-  client.setTimeout(BACKEND_RESPONSE_TIMEOUT_MS / 1000);
+  uploadClient.setTimeout(BACKEND_RESPONSE_TIMEOUT_MS / 1000);
+  uploadClient.setNoDelay(true);  // send each audio chunk promptly (disable Nagle)
 
-  Serial.printf("[network] POST started bytes=%u url=%s\n",
-                static_cast<unsigned int>(wavBytes), BNT_BACKEND_URL);
+  uploadClient.printf("POST %s HTTP/1.1\r\n", path);
+  uploadClient.printf("Host: %s:%u\r\n", host, static_cast<unsigned int>(port));
+  uploadClient.print("Content-Type: audio/L16;rate=16000;channels=1\r\n");
+  uploadClient.print("Transfer-Encoding: chunked\r\n");
+  uploadClient.print("Connection: close\r\n\r\n");
 
-  // Request line + headers.
-  client.printf("POST %s HTTP/1.1\r\n", path);
-  client.printf("Host: %s:%u\r\n", host, static_cast<unsigned int>(port));
-  client.print("Content-Type: audio/wav\r\n");
-  client.printf("Content-Length: %u\r\n", static_cast<unsigned int>(wavBytes));
-  client.print("Connection: close\r\n\r\n");
+  uploadActive = true;
+  Serial.printf("[network] upload started (chunked) url=%s\n", BNT_BACKEND_URL);
+  return true;
+}
 
-  // Body: 44-byte header, then PCM in chunks straight from the record buffer.
-  client.write(wavHeader, WAV_HEADER_SIZE);
-  const uint8_t *pcm = reinterpret_cast<const uint8_t *>(recordingPcm);
-  size_t sent = 0;
-  while (sent < pcmBytes) {
-    size_t chunk = pcmBytes - sent;
-    if (chunk > 1460) {
-      chunk = 1460;
-    }
-    const size_t wrote = client.write(pcm + sent, chunk);
-    if (wrote == 0) {
-      Serial.println("[network] write stalled, aborting");
-      client.stop();
-      return false;
-    }
-    sent += wrote;
+// Close the chunked upload, read the response, and stream it to the speaker.
+// Returns true if a backend response was played.
+static bool finishUploadAndPlay() {
+  if (!uploadActive) {
+    uploadClient.stop();
+    Serial.println("[network] no upload to finish (offline or connect failed)");
+    return false;
   }
 
+  // Terminating zero-length chunk ends the request body.
+  uploadClient.print("0\r\n\r\n");
+  uploadActive = false;
+
   // Status line: "HTTP/1.1 200 OK".
-  const String statusLine = client.readStringUntil('\n');
+  const String statusLine = uploadClient.readStringUntil('\n');
   int statusCode = 0;
   const int sp = statusLine.indexOf(' ');
   if (sp >= 0) {
@@ -805,8 +677,8 @@ static bool sendWavToBackend() {
   // Headers: capture Content-Length and X-BNT-Text, stop at the blank line.
   long contentLength = -1;
   String bntText = "";
-  while (client.connected() || client.available()) {
-    const String line = client.readStringUntil('\n');
+  while (uploadClient.connected() || uploadClient.available()) {
+    const String line = uploadClient.readStringUntil('\n');
     if (line.length() == 0 || line == "\r") {
       break;
     }
@@ -820,24 +692,16 @@ static bool sendWavToBackend() {
     }
   }
 
-  const uint32_t latencyMs = millis() - startedAt;
-
   if (statusCode != 200) {
-    Serial.printf("[network] status=%d latency_ms=%lu content_length=%ld\n",
-                  statusCode, static_cast<unsigned long>(latencyMs), contentLength);
-    client.stop();
+    Serial.printf("[network] status=%d content_length=%ld\n", statusCode, contentLength);
+    uploadClient.stop();
     return false;
   }
 
-  // No response-size cap: playback is streamed, so length is bounded by the
-  // connection/idle timeout, not by RAM.
-  Serial.printf("[network] status=200 latency_ms=%lu content_length=%ld text=%s\n",
-                static_cast<unsigned long>(latencyMs), contentLength, bntText.c_str());
-
-  // Stream the response straight to the speaker — no full-clip buffer.
+  Serial.printf("[network] status=200 content_length=%ld text=%s\n", contentLength, bntText.c_str());
   Serial.println("[audio_out] source=backend_response (streamed)");
-  const size_t played = streamResponseToSpeaker(client, contentLength);
-  client.stop();
+  const size_t played = streamResponseToSpeaker(uploadClient, contentLength);
+  uploadClient.stop();
   Serial.printf("[audio_out] streamed samples=%u\n", static_cast<unsigned int>(played));
 
   return played > 0;
@@ -918,25 +782,9 @@ void setup() {
   Serial.flush();
   delay(250);
 
-  // Adaptive allocation: largest contiguous block that fits and still leaves
-  // heap for Wi-Fi. The ESP32 heap can't give one 192 KB block even with 300 KB
-  // free, so we step the target down until malloc succeeds.
-  for (uint32_t ms = TARGET_RECORDING_MS; ms >= MIN_RECORDING_MS; ms -= RECORDING_STEP_MS) {
-    const size_t samples = SAMPLE_RATE * ms / 1000;
-    int16_t *candidate = static_cast<int16_t *>(malloc(samples * sizeof(int16_t)));
-    if (candidate != nullptr && ESP.getFreeHeap() >= MIN_FREE_HEAP_AFTER_ALLOC) {
-      recordingPcm = candidate;
-      recordingCapacitySamples = samples;
-      break;
-    }
-    free(candidate);  // free(nullptr) is a no-op
-  }
-  Serial.printf(
-      "[boot] recording buffer bytes=%u ms=%u allocated=%s free_heap=%lu\n",
-      static_cast<unsigned int>(recordingCapacitySamples * sizeof(int16_t)),
-      static_cast<unsigned int>(recordingCapacitySamples * 1000 / SAMPLE_RATE),
-      recordingPcm == nullptr ? "no" : "yes",
-      static_cast<unsigned long>(ESP.getFreeHeap()));
+  // Recording is streamed to the backend (chunked) — no audio buffer to allocate.
+  Serial.printf("[boot] streaming recording (no buffer) free_heap=%lu\n",
+                static_cast<unsigned long>(ESP.getFreeHeap()));
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
@@ -965,12 +813,14 @@ void loop() {
     wasPressed = true;
     Serial.println("[button] pressed");
     playBeep();
+    beginUpload();  // open chunked connection before recording (sets uploadActive)
     startMicI2S();
-    resetRecordingBuffer();
+    resetRecordingStats();
   }
 
   if (pressed) {
-    recordMicWhileHeld();
+    recordMicWhileHeld();  // streams each mic chunk to the open upload
+    return;  // skip the idle delay; i2s_read paces the capture loop in real time
   }
 
   if (!pressed && wasPressed) {
@@ -978,11 +828,8 @@ void loop() {
     Serial.println("[button] released");
     stopMic();
     printRecordingSummary();
-    wrapRecordingAsWav();
-    const bool playedResponse = sendWavToBackend();
-    if (!playedResponse) {
-      Serial.println("[audio_out] source=local_recording");
-      playRecordedAudio();
+    if (!finishUploadAndPlay()) {
+      Serial.println("[audio_out] no response (upload failed or offline)");
     }
   }
 
