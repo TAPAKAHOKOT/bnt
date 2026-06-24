@@ -82,6 +82,12 @@ def make_silence_wav(duration_ms: int = 350) -> bytes:
     return _write_wav(b"\x00\x00" * frame_count, frame_count)
 
 
+def pcm16_to_mvp_wav(pcm: bytes) -> bytes:
+    """Wrap mono 16-bit little-endian PCM in an MVP-format WAV container."""
+    frame_count = len(pcm) // MVP_SAMPLE_WIDTH_BYTES
+    return _write_wav(pcm, frame_count)
+
+
 def _write_wav(pcm: bytes, frame_count: int) -> bytes:
     output = io.BytesIO()
     with wave.open(output, "wb") as wav:

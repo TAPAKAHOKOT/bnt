@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 import uuid
 
@@ -10,6 +11,7 @@ from fastapi.responses import JSONResponse, Response
 from backend.app.audio.validation import validate_request_wav
 from backend.app.config import BackendConfig, load_config
 from backend.app.services.fake_response_service import FakeResponseService
+from backend.app.services.openai_response_service import OpenAIResponseService
 from backend.app.services.response_service import ResponseService, ResponseServiceError
 from bnt_core.wav import WavValidationError, validate_mvp_wav
 
@@ -17,7 +19,16 @@ router = APIRouter()
 logger = logging.getLogger("bnt.backend.ask_audio")
 
 
-def get_response_service() -> ResponseService:
+def get_response_service(config: BackendConfig = Depends(load_config)) -> ResponseService:
+    mode = (os.getenv("BNT_RESPONSE_SERVICE") or "").strip().lower()
+    if mode == "fake":
+        return FakeResponseService()
+    if mode == "openai":
+        return OpenAIResponseService(config)
+    # Auto: prefer OpenAI when a key is configured, otherwise fall back to the
+    # stub so local development and tests work without credentials.
+    if config.openai_api_key:
+        return OpenAIResponseService(config)
     return FakeResponseService()
 
 

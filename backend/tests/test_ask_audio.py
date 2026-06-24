@@ -61,6 +61,7 @@ def test_ask_audio_rejects_response_over_duration_limit() -> None:
         def generate_response_audio(self, input_wav_bytes: bytes) -> bytes:
             return make_sine_wav(duration_ms=5100)
 
+    app.dependency_overrides[load_config] = lambda: BackendConfig(max_response_duration_ms=5000)
     app.dependency_overrides[get_response_service] = lambda: LongResponseService()
 
     response = client.post("/ask-audio", content=make_sine_wav(), headers={"Content-Type": "audio/wav"})
