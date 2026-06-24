@@ -23,3 +23,6 @@ responses/
 # Firmware build/cache output
 firmware/.pio/
 firmware/.platformio-core/
+
+# Firmware local secrets (Wi-Fi creds + backend URL)
+firmware/include/secrets.h

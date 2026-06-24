@@ -8,7 +8,23 @@ Flow:
 pressed -> beep -> record PCM while held -> released -> print recording stats -> play recording
 ```
 
-No Wi-Fi, OpenAI, file recording, TTS, or backend code is included here.
+At boot the firmware now also joins the local Wi-Fi (step 1 of the
+firmware/backend bridge). It does not send anything yet — no OpenAI, file
+recording, TTS, or backend request code is included here. Wi-Fi failure is
+non-fatal: the local record/playback loop still runs offline.
+
+## Wi-Fi / backend config
+
+Credentials live in a gitignored header. Copy the example and edit it:
+
+```sh
+cp include/secrets.example.h include/secrets.h
+# then edit include/secrets.h with your Wi-Fi SSID/password and backend URL
+```
+
+`include/secrets.h` is gitignored — never commit real credentials. The OpenAI
+API key must NEVER live in firmware; only Wi-Fi credentials and the local
+backend URL belong in `secrets.h`.
 
 ## Pinout
 
@@ -71,6 +87,8 @@ Expected serial behavior:
 ```text
 BNT_SERIAL_OK baud=115200
 [boot] bnt hardware check
+[wifi] connecting ssid=...
+[wifi] connected ip=... rssi=... backend=http://.../ask-audio
 [button] pressed
 [audio_out] beep
 [audio_in] mic start
