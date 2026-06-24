@@ -102,6 +102,7 @@ BNT_SERIAL_OK baud=115200
 [boot] bnt hardware check
 [wifi] connecting ssid=...
 [wifi] connected ip=... rssi=... backend=http://.../ask-audio
+[audio_out] cue: ready
 [button] pressed
 [audio_out] cue: record start
 [audio_in] mic start
@@ -116,7 +117,8 @@ BNT_SERIAL_OK baud=115200
 [audio_out] streamed samples=...
 ```
 
-Audio cues: a short rising tone marks **recording start** and a lower tone marks
+Audio cues: a two-note ascending **ready** chime plays once at boot (after Wi-Fi
+connects); a short rising tone marks **recording start** and a lower tone marks
 **recording stop**. While the backend runs STT→chat→TTS, the speaker plays a
 quiet periodic "thinking" blip until the response begins streaming.
 

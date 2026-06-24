@@ -265,6 +265,22 @@ static void writeToneToI2S(uint32_t freqHz, uint32_t durationMs, float gain) {
   }
 }
 
+// Two-note ascending chime to signal the device booted and is ready.
+static void playReadyChime() {
+  startSpeakerI2S();
+  setAmpEnabled(true);
+  delay(8);
+  writeSpeakerSilence(60);  // let the amp soft-unmute before the tones
+  writeToneToI2S(660, 120, BEEP_GAIN);
+  writeToneToI2S(988, 150, BEEP_GAIN);
+  writeSpeakerSilence(30);
+  delay(SPEAKER_DRAIN_MS);  // let the DMA play out before muting
+  setAmpEnabled(false);
+  delay(10);
+  stopI2S();
+  silenceSpeakerPins();
+}
+
 // Standalone short cue tone: set up the speaker, play, tear down.
 static void playCue(uint32_t freqHz) {
   startSpeakerI2S();
@@ -844,6 +860,9 @@ void setup() {
   Serial.printf("[boot] mic_gain=%ld playback_gain=%.2f\n", static_cast<long>(MIC_GAIN), PLAYBACK_GAIN);
 
   connectWiFi();
+
+  Serial.println("[audio_out] cue: ready");
+  playReadyChime();
 }
 
 void loop() {
