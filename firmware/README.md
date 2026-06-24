@@ -5,13 +5,16 @@ Minimal ESP32 hardware loop for the confirmed breadboard wiring.
 Flow:
 
 ```text
-pressed -> beep -> record PCM while held -> released -> print recording stats -> play recording
+pressed -> beep -> record PCM while held -> released -> wrap WAV
+        -> POST /ask-audio -> play backend response (fallback: local recording)
 ```
 
-At boot the firmware now also joins the local Wi-Fi (step 1 of the
-firmware/backend bridge). It does not send anything yet — no OpenAI, file
-recording, TTS, or backend request code is included here. Wi-Fi failure is
-non-fatal: the local record/playback loop still runs offline.
+At boot the firmware joins the local Wi-Fi, then on each press streams the
+recorded WAV to the backend's `POST /ask-audio` and plays the WAV it returns.
+No OpenAI key, file recording, or TTS lives in firmware — only the Wi-Fi
+credentials and backend URL. Both Wi-Fi and the request are non-fatal: if
+either fails, the device falls back to playing the local recording so the
+hardware loop still works offline (`[audio_out] source=local_recording`).
 
 ## Wi-Fi / backend config
 
@@ -97,9 +100,18 @@ BNT_SERIAL_OK baud=115200
 [audio_in] mic stop
 [recording] done duration_ms=... bytes=... samples=... peak=... rms=... checksum=... overflow=no
 [wav] bytes=... pcm_bytes=... sample_rate=16000 channels=1 bits=16 valid=yes
+[network] POST started bytes=... url=http://.../ask-audio
+[network] status=200 latency_ms=... response bytes=... valid=yes pcm_samples=... truncated=no text=...
+[audio_out] source=backend_response
 [audio_out] playback start bytes=... samples=...
 [audio_out] playback done
 ```
+
+`[audio_out] source=` shows whether playback is the `backend_response` (a 200
+with a valid WAV) or `local_recording` (any network failure → offline
+fallback). The backend response is decoded straight into the record buffer, so
+it is capped to the 3-second buffer (`truncated=yes` if the response was
+longer).
 
 After each recording the firmware wraps the captured PCM in a canonical
 44-byte WAV/PCM header (built in RAM, PCM left in place) and validates every
@@ -119,11 +131,15 @@ For INMP441 debugging:
 - `bytes>0` and both slots stay `0` means clocks are running but the mic data slot is silent; recheck INMP441 `VDD`, `GND`, `SD -> GPIO33`, and `L/R -> GND`.
 - If either `slot0` or `slot1` changes with voice, the microphone path is working.
 
-The recording buffer is bounded to 3 seconds at 16 kHz mono 16-bit PCM:
+The recording buffer is bounded to 6 seconds at 16 kHz mono 16-bit PCM:
 
 ```text
-max bytes = 96000
+max bytes = 192000
 ```
+
+This single buffer is reused for the backend response, so it also caps response
+playback to 6 seconds. The size is limited by internal ESP32 RAM (a larger
+buffer would starve the Wi-Fi stack); this board has no PSRAM to grow it.
 
 If `overflow=yes`, the button was held longer than the current RAM recording limit.
 Playback uses the recorded mono PCM buffer and duplicates it to both MAX98357 I2S output channels.

@@ -21,7 +21,7 @@ static constexpr i2s_port_t I2S_PORT = I2S_NUM_0;
 static constexpr uint32_t SAMPLE_RATE = 16000;
 static constexpr uint32_t DEBOUNCE_MS = 30;
 static constexpr uint32_t VOLUME_LOG_INTERVAL_MS = 120;
-static constexpr uint32_t MAX_RECORDING_MS = 3000;
+static constexpr uint32_t MAX_RECORDING_MS = 6000;
 static constexpr size_t MAX_RECORDING_SAMPLES = SAMPLE_RATE * MAX_RECORDING_MS / 1000;
 static constexpr uint32_t BEEP_DURATION_MS = 90;
 static constexpr uint32_t BEEP_FREQ_HZ = 880;
@@ -564,19 +564,24 @@ static bool parseBackendUrl(char *host, size_t hostCap, uint16_t *port, char *pa
   return true;
 }
 
-// Step 2 of the firmware/backend bridge: stream the in-RAM WAV (header + PCM)
-// to the backend over a raw socket — header first, then PCM in chunks straight
-// from the record buffer. This avoids a second large contiguous buffer, which
-// the heap cannot supply once the recording buffer is allocated. Playback of
-// the response is step 3 and is intentionally NOT done here. Failure is non-fatal.
-static void sendWavToBackend() {
+// Steps 2-3 of the firmware/backend bridge: stream the in-RAM WAV (header +
+// PCM) to the backend over a raw socket — header first, then PCM in chunks
+// straight from the record buffer. This avoids a second large contiguous
+// buffer, which the heap cannot supply once the recording buffer is allocated.
+// On a 200 response, the response PCM is decoded back into recordingPcm (the
+// request audio is already sent, so the buffer is free) and the caller plays
+// it. On any failure recordingPcm is left untouched, so the device falls back
+// to playing the local recording. Failure is non-fatal.
+//
+// Returns true if recordingPcm now holds backend response PCM to play.
+static bool sendWavToBackend() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[network] skipped: wifi not connected");
-    return;
+    return false;
   }
   if (recordingPcm == nullptr || recordingSampleCount == 0) {
     Serial.println("[network] skipped: empty recording");
-    return;
+    return false;
   }
 
   char host[64];
@@ -584,7 +589,7 @@ static void sendWavToBackend() {
   uint16_t port = 0;
   if (!parseBackendUrl(host, sizeof(host), &port, path, sizeof(path))) {
     Serial.println("[network] skipped: bad backend url");
-    return;
+    return false;
   }
 
   const size_t pcmBytes = recordingSampleCount * sizeof(int16_t);
@@ -594,7 +599,7 @@ static void sendWavToBackend() {
   const uint32_t startedAt = millis();
   if (!client.connect(host, port, HTTP_TIMEOUT_MS)) {
     Serial.printf("[network] connect failed host=%s port=%u\n", host, static_cast<unsigned int>(port));
-    return;
+    return false;
   }
   client.setTimeout(HTTP_TIMEOUT_MS / 1000);
 
@@ -621,7 +626,7 @@ static void sendWavToBackend() {
     if (wrote == 0) {
       Serial.println("[network] write stalled, aborting");
       client.stop();
-      return;
+      return false;
     }
     sent += wrote;
   }
@@ -658,21 +663,26 @@ static void sendWavToBackend() {
     Serial.printf("[network] status=%d latency_ms=%lu content_length=%ld\n",
                   statusCode, static_cast<unsigned long>(latencyMs), contentLength);
     client.stop();
-    return;
+    return false;
   }
 
   if (contentLength > static_cast<long>(MAX_RESPONSE_BYTES)) {
     Serial.printf("[network] response too large: %ld > %u\n",
                   contentLength, static_cast<unsigned int>(MAX_RESPONSE_BYTES));
     client.stop();
-    return;
+    return false;
   }
 
-  // Read the body, keeping only the first 44 bytes for header validation and
-  // counting the rest. No large response buffer is needed for step 2.
+  // Read the body: keep the first 44 bytes for header validation, then decode
+  // the PCM straight into recordingPcm (request audio is already sent, so the
+  // buffer is free). Bytes are little-endian on both wire and ESP32, so a raw
+  // byte copy yields valid int16 samples. Capped to the record buffer size.
   uint8_t head[WAV_HEADER_SIZE] = {};
-  size_t headFilled = 0;
+  uint8_t *pcmDst = reinterpret_cast<uint8_t *>(recordingPcm);
+  const size_t pcmCap = MAX_RECORDING_SAMPLES * sizeof(int16_t);
   size_t bodyBytes = 0;
+  size_t pcmStored = 0;
+  bool responseTruncated = false;
   uint8_t buf[256];
   const uint32_t readStart = millis();
   while (millis() - readStart < HTTP_TIMEOUT_MS) {
@@ -688,8 +698,15 @@ static void sendWavToBackend() {
     if (r <= 0) {
       break;
     }
-    for (int i = 0; i < r && headFilled < WAV_HEADER_SIZE; ++i) {
-      head[headFilled++] = buf[i];
+    for (int i = 0; i < r; ++i) {
+      const size_t pos = bodyBytes + static_cast<size_t>(i);
+      if (pos < WAV_HEADER_SIZE) {
+        head[pos] = buf[i];
+      } else if (pcmStored < pcmCap) {
+        pcmDst[pcmStored++] = buf[i];
+      } else {
+        responseTruncated = true;
+      }
     }
     bodyBytes += static_cast<size_t>(r);
     if (contentLength > 0 && bodyBytes >= static_cast<size_t>(contentLength)) {
@@ -698,12 +715,22 @@ static void sendWavToBackend() {
   }
   client.stop();
 
+  const size_t headFilled = bodyBytes < WAV_HEADER_SIZE ? bodyBytes : WAV_HEADER_SIZE;
   const bool valid = validateResponseWav(head, headFilled);
-  Serial.printf("[network] status=200 latency_ms=%lu response bytes=%u valid=%s text=%s\n",
-                static_cast<unsigned long>(latencyMs),
-                static_cast<unsigned int>(bodyBytes),
-                valid ? "yes" : "no",
-                bntText.c_str());
+
+  // Hand the decoded response PCM to the playback path (drop a trailing odd byte).
+  recordingSampleCount = pcmStored / sizeof(int16_t);
+
+  Serial.printf(
+      "[network] status=200 latency_ms=%lu response bytes=%u valid=%s pcm_samples=%u truncated=%s text=%s\n",
+      static_cast<unsigned long>(latencyMs),
+      static_cast<unsigned int>(bodyBytes),
+      valid ? "yes" : "no",
+      static_cast<unsigned int>(recordingSampleCount),
+      responseTruncated ? "yes" : "no",
+      bntText.c_str());
+
+  return valid && recordingSampleCount > 0;
 }
 
 static bool readDebouncedButtonPressed() {
@@ -829,7 +856,8 @@ void loop() {
     stopMic();
     printRecordingSummary();
     wrapRecordingAsWav();
-    sendWavToBackend();
+    const bool playingResponse = sendWavToBackend();
+    Serial.printf("[audio_out] source=%s\n", playingResponse ? "backend_response" : "local_recording");
     playRecordedAudio();
   }
 
