@@ -110,7 +110,7 @@ def test_pipeline_calls_stt_chat_tts_and_returns_mvp_wav() -> None:
 
     # Configured models flow through to the SDK calls.
     assert client.calls["stt"]["model"] == "whisper-1"
-    assert client.calls["chat"]["model"] == "gpt-4o-mini"
+    assert client.calls["chat"]["model"] == "gpt-4o"
 
     # Output is a valid MVP WAV.
     info = validate_mvp_wav(output)
