@@ -14,8 +14,8 @@ receive audio -> call AI or stub service -> return MVP-format WAV response -> lo
 
 - Do not store OpenAI API keys in firmware.
 - Do not require accounts or device registration for MVP.
-- Do not implement streaming first.
 - Keep the endpoint simple enough for ESP32 HTTP clients.
+- Keep the request-response loop simple; streaming was added only after it worked (chunked `audio/L16` upload + streamed playback).
 - Preserve the same API contract for simulator and firmware.
 
 ## Recommended Tech
@@ -58,30 +58,35 @@ backend/
 
 ## MVP Audio Contract
 
-Use one wire format until the MVP loop works:
+Wire format:
 
 ```text
-Content-Type: audio/wav
+Content-Type: audio/wav (or audio/L16 for raw streamed PCM from firmware)
 Encoding: PCM signed 16-bit little-endian
 Channels: 1
 Sample rate: 16000 Hz
-Request max duration: 20 seconds from simulator, 5 seconds from first firmware hardware pass
-Backend request max size: 700 KB
-Firmware local request max size: 200 KB for first hardware pass
-Backend response max duration: 5 seconds for all MVP clients until hardware proves more
-Backend response max size: 200 KB for all MVP clients until hardware proves more
-Firmware local response max size: 200 KB for first hardware pass
+Simulator request max duration: 20 seconds
+Firmware request: streamed as chunked audio/L16 — not bounded by a device RAM buffer
+Backend request max size: 700 KB (716,800 bytes)
+Backend response max duration: 30 seconds
+Backend response max size: ~1 MB (1,000,000 bytes)
+Firmware response: streamed straight to the speaker as it downloads — not bounded by a device RAM buffer
 ```
 
-The backend may transcode internally, but simulator and firmware should only need to send and receive this WAV shape for the MVP.
+The backend may transcode internally. The simulator sends and receives the WAV
+shape above; the firmware streams the same PCM as raw `audio/L16` and the backend
+wraps it into a WAV before processing.
 
-The backend should enforce the global 700 KB request limit and the 200 KB response limit. The firmware should enforce the smaller first-hardware 200 KB request limit locally before sending audio and should reject responses above 200 KB. Do not add client-specific backend policy until the MVP needs it.
+The backend enforces the global 700 KB request limit and the ~1 MB / 30 s response
+limit. The firmware streams both the request and the response, so it relies on the
+backend's limits rather than buffering and capping locally. Do not add
+client-specific backend policy until the MVP needs it.
 
 ### First Endpoint
 
 ```http
 POST /ask-audio
-Content-Type: audio/wav
+Content-Type: audio/wav   # or audio/L16 for raw streamed PCM
 ```
 
 Request body:
@@ -95,7 +100,7 @@ Recommended first response:
 ```http
 200 OK
 Content-Type: audio/wav
-X-BNT-Text: optional short text answer
+X-BNT-Text: currently a fixed placeholder ("stub response"); the reply text is not surfaced yet
 X-BNT-Request-Id: generated request id
 ```
 
@@ -270,8 +275,7 @@ Simplifications:
 
 - User accounts.
 - Device registration.
-- Persistent conversation memory.
-- Streaming audio.
+- Durable / cross-restart conversation memory (the backend keeps only short-lived in-process multi-turn context, `BNT_CONVERSATION_TTL_MS`).
 - Web dashboard.
 - Cloud deployment automation.
 - API keys in firmware.

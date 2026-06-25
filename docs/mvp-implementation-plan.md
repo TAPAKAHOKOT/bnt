@@ -10,6 +10,22 @@ press and hold button -> record voice -> release button -> send audio to backend
 
 The MVP must prove the interaction before optimizing hardware, enclosure, power, or connectivity. Development is simulator-first because physical components may not have arrived yet.
 
+## Implementation Status
+
+The loop is implemented and has advanced past the original request-response-only
+plan below. Notable deviations from this document:
+
+- the shared state machine and WAV helpers live in a top-level `bnt_core/` package
+  (imported by both backend and simulator), not in a per-simulator `state_machine.py`;
+- the firmware is a single `src/main.cpp` breadboard hardware check (no
+  `BNT_FAKE_HARDWARE` modules) — see `firmware-plan.md`;
+- the backend runs the full OpenAI STT → chat → TTS pipeline with short-lived
+  in-process multi-turn context;
+- streaming is implemented in both directions (chunked `audio/L16` mic upload and
+  streamed response playback), added after the basic loop worked.
+
+The phases and structure below are kept as the original plan / build order.
+
 ## Guiding Constraints
 
 - Keep the MVP focused on the full press-to-talk loop.

@@ -12,6 +12,23 @@ read button -> record INMP441 audio -> POST to backend -> play response through 
 
 It must also compile and test with fake hardware before components are connected.
 
+## Implementation Status
+
+The shipped firmware diverges from the modular fake/real design below — that
+layered structure and the `BNT_FAKE_HARDWARE` flag were never built. What exists
+today is a single `src/main.cpp` breadboard hardware check that runs directly on
+real components:
+
+- joins Wi-Fi at boot and plays a ready chime;
+- on press, opens a chunked HTTP upload and streams the INMP441 PCM as raw
+  `audio/L16` while the button is held (no bounded WAV buffer is allocated);
+- on release, finishes the upload and streams the backend's WAV response straight
+  to the MAX98357 as it downloads.
+
+So the "bounded 5-second WAV buffers" and per-module fake/real files in the rest
+of this plan describe the original intent, not the current code. The sections
+below are kept as design history.
+
 ## Constraints
 
 - No OpenAI API key in firmware.

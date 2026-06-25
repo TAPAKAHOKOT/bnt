@@ -152,7 +152,7 @@ Definition of done:
 
 - `OPENAI_API_KEY` is used only by backend.
 - Simulator receives AI response audio that parses as MVP-format WAV, has non-empty PCM frames, and starts playback without error.
-- Backend AI response audio stays within the MVP 5-second / 200 KB response cap.
+- Backend AI response audio stays within the MVP 30-second / ~1 MB response cap.
 - OpenAI failures return controlled backend errors.
 - Automated tests do not require real OpenAI.
 

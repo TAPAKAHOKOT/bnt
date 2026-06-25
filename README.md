@@ -2,14 +2,14 @@
 
 Simulator-first MVP prototype for a wearable physical button for talking to AI.
 
-The first implementation slice is intentionally small:
+What is implemented today:
 
-- shared, testable MVP state machine;
-- fake button/audio/network components for no-hardware tests;
-- FastAPI backend stub with `POST /ask-audio`;
-- simulator fixture entry point that runs the press-to-talk loop without electronics.
+- shared, testable MVP state machine (`bnt_core`);
+- FastAPI backend with `POST /ask-audio` that returns MVP-format WAV, backed by either a fake sine response or the OpenAI STT → chat → TTS pipeline (with short-lived multi-turn context);
+- simulator fixture entry point that runs the press-to-talk loop without electronics (fake audio in/out);
+- ESP32 breadboard firmware that streams the microphone to the backend over Wi-Fi and streams the spoken answer back to the speaker.
 
-Out of scope for this slice: firmware hardware drivers, streaming, LTE, battery, PCB, OTA, mobile app, wake word, screen, and account system.
+Out of scope: LTE, battery, PCB, OTA, mobile app, wake word, screen, and account system. Live Spacebar/microphone/speaker support in the simulator is also not implemented yet.
 
 ## Setup
 
@@ -66,15 +66,18 @@ python -m simulator.bnt_simulator.main --backend-url http://127.0.0.1:8000
 
 The simulator currently uses fake audio input/output. Live Spacebar, microphone, and speaker support belongs to the next simulator milestone.
 
-## Firmware Hardware Check
+## Firmware
 
-The current breadboard-only ESP32 check lives in `firmware/`.
+The breadboard ESP32 firmware lives in `firmware/`.
 
-It verifies this simple hardware loop:
+At boot it joins Wi-Fi and plays a ready chime. The press-to-talk loop is:
 
 ```text
-pressed -> beep -> record PCM while held -> released -> print recording stats -> play recording
+pressed -> record-start cue -> stream mic PCM to backend while held
+        -> released -> record-stop cue -> stream backend WAV response to speaker
 ```
+
+The microphone is streamed up as chunked `audio/L16` and the response is streamed straight to the speaker, so neither length is bounded by device RAM. No OpenAI key or TTS lives in firmware — only the Wi-Fi credentials and backend URL. On any network failure nothing is played (there is no offline playback fallback).
 
 Run it with PlatformIO:
 
@@ -84,4 +87,4 @@ pio run -t upload
 pio device monitor -b 115200
 ```
 
-This firmware check intentionally does not include Wi-Fi, OpenAI, file recording, TTS, or backend calls.
+See `firmware/README.md` for wiring, pinout, gain constants, and serial output details.
