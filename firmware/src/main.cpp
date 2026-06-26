@@ -36,6 +36,9 @@ static constexpr uint32_t THINKING_INTERVAL_MS = 700;
 static constexpr uint32_t ERROR_FREQ_HI_HZ = 440;
 static constexpr uint32_t ERROR_FREQ_LO_HZ = 220;
 static constexpr uint32_t ERROR_BEEP_MS = 200;
+// After a press interrupts playback, the button must stay held at least this
+// long to count as a new recording gesture; a shorter tap only stops playback.
+static constexpr uint32_t INTERRUPT_HOLD_MS = 300;
 static constexpr int32_t MIC_GAIN = 3;
 static constexpr float PLAYBACK_GAIN = 1.0f;  // unity — no extra amplification
 // Time to let the speaker I2S DMA drain to the DAC before muting. Must exceed
@@ -549,13 +552,20 @@ static size_t readFully(WiFiClient &client, uint8_t *dst, size_t n, uint32_t tim
   return got;
 }
 
+// Outcome of finishUploadAndPlay so loop() can distinguish a normal response,
+// a failure (negative cue), and playback cut short by a new button press.
+enum PlayOutcome { PLAY_OK, PLAY_FAILED, PLAY_INTERRUPTED };
+
+static bool readDebouncedButtonPressed();
+
 // Stream the WAV response body straight to the speaker without buffering the
 // whole clip: read and validate the 44-byte header, then read PCM in small
 // chunks and feed I2S TX as it arrives. This removes the response-length RAM
 // cap — the big recording buffer is never used for playback. The enlarged I2S
 // DMA buffers are the jitter cushion; a slow network can cause brief underruns.
-// Returns the number of mono samples played (0 = nothing/invalid header).
-static size_t streamResponseToSpeaker(WiFiClient &client, long contentLength) {
+// Returns the number of mono samples played (0 = nothing/invalid header). Sets
+// `interrupted` if a button press aborted playback mid-stream.
+static size_t streamResponseToSpeaker(WiFiClient &client, long contentLength, bool &interrupted) {
   uint8_t header[WAV_HEADER_SIZE];
   if (readFully(client, header, WAV_HEADER_SIZE, HTTP_TIMEOUT_MS) != WAV_HEADER_SIZE) {
     Serial.println("[audio_out] stream: short header");
@@ -591,6 +601,14 @@ static size_t streamResponseToSpeaker(WiFiClient &client, long contentLength) {
   uint32_t lastData = millis();
 
   while (dataRemaining != 0) {
+    // A new button press interrupts playback (handled by loop(): a held button
+    // becomes a new recording, a short tap just stops here).
+    if (readDebouncedButtonPressed()) {
+      Serial.println("[audio_out] stream: interrupted by button press");
+      interrupted = true;
+      break;
+    }
+
     const int avail = client.available();
     if (avail <= 0) {
       if (!client.connected()) {
@@ -660,8 +678,14 @@ static size_t streamResponseToSpeaker(WiFiClient &client, long contentLength) {
     Serial.printf("[audio_out] stream: truncated, %ld bytes unplayed\n", dataRemaining);
   }
 
-  writeSpeakerSilence(40);
-  delay(SPEAKER_DRAIN_MS);  // let the DMA play out the response tail before muting
+  if (interrupted) {
+    // Snappy stop: drop queued audio instead of draining the 250 ms tail.
+    i2s_zero_dma_buffer(I2S_PORT);
+    delay(10);
+  } else {
+    writeSpeakerSilence(40);
+    delay(SPEAKER_DRAIN_MS);  // let the DMA play out the response tail before muting
+  }
   setAmpEnabled(false);
   delay(10);
   stopI2S();
@@ -709,12 +733,13 @@ static bool beginUpload() {
 }
 
 // Close the chunked upload, read the response, and stream it to the speaker.
-// Returns true if a backend response was played.
-static bool finishUploadAndPlay() {
+// Returns PLAY_OK if a response played, PLAY_FAILED on error/no response, or
+// PLAY_INTERRUPTED if a new button press aborted the wait/playback.
+static PlayOutcome finishUploadAndPlay() {
   if (!uploadActive) {
     uploadClient.stop();
     Serial.println("[network] no upload to finish (offline or connect failed)");
-    return false;
+    return PLAY_FAILED;
   }
 
   // Terminating zero-length chunk ends the request body.
@@ -732,6 +757,18 @@ static bool finishUploadAndPlay() {
     uint32_t lastBlip = 0;
     while (uploadClient.available() == 0 && uploadClient.connected() &&
            millis() - waitStart < BACKEND_RESPONSE_TIMEOUT_MS) {
+      // Let the user bail out (and start a new question) while still waiting.
+      if (readDebouncedButtonPressed()) {
+        Serial.println("[network] interrupted by button while waiting for response");
+        uploadClient.stop();
+        i2s_zero_dma_buffer(I2S_PORT);
+        delay(10);
+        setAmpEnabled(false);
+        delay(10);
+        stopI2S();
+        silenceSpeakerPins();
+        return PLAY_INTERRUPTED;
+      }
       const uint32_t now = millis();
       if (now - lastBlip >= THINKING_INTERVAL_MS) {
         lastBlip = now;
@@ -778,16 +815,21 @@ static bool finishUploadAndPlay() {
     delay(10);
     stopI2S();
     silenceSpeakerPins();
-    return false;
+    return PLAY_FAILED;
   }
 
   Serial.printf("[network] status=200 content_length=%ld text=%s\n", contentLength, bntText.c_str());
   Serial.println("[audio_out] source=backend_response (streamed)");
-  const size_t played = streamResponseToSpeaker(uploadClient, contentLength);
+  bool interrupted = false;
+  const size_t played = streamResponseToSpeaker(uploadClient, contentLength, interrupted);
   uploadClient.stop();
-  Serial.printf("[audio_out] streamed samples=%u\n", static_cast<unsigned int>(played));
+  Serial.printf("[audio_out] streamed samples=%u interrupted=%d\n",
+                static_cast<unsigned int>(played), interrupted ? 1 : 0);
 
-  return played > 0;
+  if (interrupted) {
+    return PLAY_INTERRUPTED;
+  }
+  return played > 0 ? PLAY_OK : PLAY_FAILED;
 }
 
 static bool readDebouncedButtonPressed() {
@@ -917,10 +959,36 @@ void loop() {
     printRecordingSummary();
     Serial.println("[audio_out] cue: record stop");
     playCue(REC_END_FREQ_HZ);
-    if (!finishUploadAndPlay()) {
+    const PlayOutcome outcome = finishUploadAndPlay();
+    if (outcome == PLAY_FAILED) {
       Serial.println("[audio_out] no response (upload failed or offline)");
       Serial.println("[audio_out] cue: error");
       playErrorCue();  // negative double-beep so the user hears the failure
+    } else if (outcome == PLAY_INTERRUPTED) {
+      // Playback was stopped by a new press. Keep watching the button: if the
+      // user holds past the threshold, start a fresh recording (same as a
+      // normal press-and-hold); a short tap that's already released just leaves
+      // playback stopped.
+      const uint32_t holdStart = millis();
+      bool held = false;
+      while (readDebouncedButtonPressed()) {
+        if (millis() - holdStart >= INTERRUPT_HOLD_MS) {
+          held = true;
+          break;
+        }
+        delay(5);
+      }
+      if (held) {
+        Serial.println("[button] held after interrupt -> start recording");
+        Serial.println("[audio_out] cue: record start");
+        playCue(REC_START_FREQ_HZ);
+        beginUpload();
+        startMicI2S();
+        resetRecordingStats();
+        wasPressed = true;  // continue capturing until release (normal flow)
+      } else {
+        Serial.println("[button] short tap -> playback interrupted only");
+      }
     }
   }
 
