@@ -1,0 +1,51 @@
+name: Deploy backend
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - "bnt_core/**"
+      - "pyproject.toml"
+      - "Dockerfile"
+      - "docker-compose.yml"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-backend
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Copy project to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SERVER_IP }}
+          username: ${{ secrets.SERVER_USER }}
+          password: ${{ secrets.SERVER_PASSWORD }}
+          source: "Dockerfile,docker-compose.yml,pyproject.toml,backend,bnt_core"
+          target: ${{ secrets.SERVER_PATH }}
+          overwrite: true
+
+      - name: Build and restart container
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_IP }}
+          username: ${{ secrets.SERVER_USER }}
+          password: ${{ secrets.SERVER_PASSWORD }}
+          script: |
+            set -e
+            cd "${{ secrets.SERVER_PATH }}"
+            # Write the runtime env file (compose reads it via env_file).
+            cat > .env <<EOF
+            OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+            EOF
+            chmod 600 .env
+            docker compose up -d --build
+            docker image prune -f
+            docker compose ps
