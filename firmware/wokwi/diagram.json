@@ -16,30 +16,37 @@
     {
       "type": "wokwi-pushbutton",
       "id": "btn",
-      "top": 266,
+      "top": 275.6,
       "left": 28.4,
       "rotate": 270,
       "attrs": { "color": "green", "label": "BUTTON GPIO13" }
     },
-    { "type": "chip-speaker", "id": "spk", "top": 202, "left": 150, "attrs": {} }
+    {
+      "type": "chip-speaker",
+      "id": "spk",
+      "top": 268.6,
+      "left": 82.58,
+      "rotate": 90,
+      "attrs": {}
+    }
   ],
   "connections": [
-    [ "esp:D13", "btn:1.l", "green", [ "h-53", "v206.1", "h86.4" ] ],
-    [ "btn:2.l", "esp:GND.1", "black", [ "v9.6", "h86.6", "v-196.6" ] ],
+    [ "esp:D13", "btn:1.l", "green", [ "h-53", "v215.7", "h86.4" ] ],
+    [ "btn:2.l", "esp:GND.1", "black", [ "v9.6", "h105.8", "v-206.2" ] ],
     [ "mic:VDD", "esp:3V3", "red", [ "v-9.6", "h163.2", "v206.5" ] ],
     [ "mic:GND", "esp:GND.2", "black", [ "v-19.2", "h28.8", "v206.6" ] ],
     [ "mic:SCK", "esp:D26", "yellow", [ "v40.21", "v-4.6" ] ],
     [ "mic:WS", "esp:D25", "blue", [ "v21.01", "v4.9" ] ],
     [ "mic:SD", "esp:D33", "green", [ "v11.41", "v4.9" ] ],
     [ "mic:L/R", "esp:GND.2", "black", [ "v-19.2", "h38.4", "v206.6" ] ],
-    [ "amp:Vin", "esp:VIN", "red", [ "h-19.2", "v-71.9" ] ],
+    [ "amp:Vin", "esp:VIN", "red", [ "h11.41", "v28.8", "h-124.8", "v-110.3" ] ],
     [ "amp:GND", "esp:GND.3", "black", [] ],
-    [ "amp:BCLK", "esp:D27", "yellow", [ "h30.61", "v28.8", "h-172.8", "v-167.6" ] ],
-    [ "amp:LRC", "esp:D22", "blue", [ "h11.41", "v-215.6" ] ],
-    [ "amp:DIN", "esp:D21", "green", [ "h21.01", "v-205.9" ] ],
+    [ "amp:BCLK", "esp:D27", "yellow", [ "h-38.4", "v-110" ] ],
+    [ "amp:LRC", "esp:D22", "blue", [ "h-67.2", "v-278.4", "h182.4", "v101.2" ] ],
+    [ "amp:DIN", "esp:D21", "green", [ "h-76.8", "v-307.2", "h201.6", "v139.7" ] ],
     [ "amp:SD", "esp:D14", "orange", [ "h-28.8", "v-129.6" ] ],
-    [ "amp:OUT+", "spk:+", "purple", [] ],
-    [ "amp:OUT-", "spk:-", "gray", [] ]
+    [ "amp:OUT+", "spk:+", "purple", [ "h40.21", "h-9.6" ] ],
+    [ "amp:OUT-", "spk:-", "gray", [ "h11.41", "h9.6" ] ]
   ],
   "dependencies": {}
 }
