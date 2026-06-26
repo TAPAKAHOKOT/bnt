@@ -50,6 +50,9 @@ static constexpr uint32_t SPEAKER_DRAIN_MS = 250;
 static constexpr size_t MIC_READ_FRAMES = 512;
 
 static constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
+// While offline, retry the Wi-Fi link this often (each attempt sounds a blip).
+static constexpr uint32_t WIFI_RECONNECT_INTERVAL_MS = 5000;
+static constexpr uint32_t WIFI_RECONNECT_BLIP_MS = 90;
 static constexpr uint32_t HTTP_TIMEOUT_MS = 10000;
 // The backend runs STT -> chat -> TTS via OpenAI, which can take tens of seconds
 // (slow/retried calls). Wait this long for the response status before giving up.
@@ -324,6 +327,46 @@ static void playErrorCue() {
   delay(10);
   stopI2S();
   silenceSpeakerPins();
+}
+
+
+// Set up the speaker, play a short series of tones, tear down. Shared by the
+// Wi-Fi status cues. (The boot/record cues predate this and inline the steps.)
+static void playToneSequence(const uint32_t *freqs, const uint32_t *durs, size_t n, float gain) {
+  startSpeakerI2S();
+  setAmpEnabled(true);
+  delay(8);
+  writeSpeakerSilence(60);  // let the amp soft-unmute before the tones
+  for (size_t i = 0; i < n; ++i) {
+    writeToneToI2S(freqs[i], durs[i], gain);
+  }
+  writeSpeakerSilence(30);
+  delay(SPEAKER_DRAIN_MS);  // let the DMA play out before muting
+  setAmpEnabled(false);
+  delay(10);
+  stopI2S();
+  silenceSpeakerPins();
+}
+
+// Wi-Fi connection lost: low descending pair ("uh-oh").
+static void playWifiLostCue() {
+  static const uint32_t f[] = {330, 247};
+  static const uint32_t d[] = {160, 200};
+  playToneSequence(f, d, 2, BEEP_GAIN);
+}
+
+// Wi-Fi back online: bright ascending pair ("ok").
+static void playWifiReconnectedCue() {
+  static const uint32_t f[] = {523, 784};
+  static const uint32_t d[] = {120, 150};
+  playToneSequence(f, d, 2, BEEP_GAIN);
+}
+
+// Quiet single blip emitted on each reconnect attempt so the user hears it trying.
+static void playWifiTryBlip() {
+  static const uint32_t f[] = {392};
+  static const uint32_t d[] = {WIFI_RECONNECT_BLIP_MS};
+  playToneSequence(f, d, 1, THINKING_GAIN);
 }
 
 
@@ -875,6 +918,7 @@ static void connectWiFi() {
   Serial.printf("[wifi] connecting ssid=%s\n", WIFI_SSID);
 
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);  // let the stack also reconnect on its own
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   const uint32_t startedAt = millis();
@@ -895,6 +939,46 @@ static void connectWiFi() {
         "[wifi] failed status=%d: continuing offline (local record/playback only)\n",
         static_cast<int>(WiFi.status()));
     scanVisibleNetworks();
+  }
+}
+
+// Wi-Fi link state for maintainWiFi(): track transitions so a cue sounds only
+// when the link actually changes, and throttle reconnect attempts.
+static bool wifiOnline = false;
+static uint32_t lastReconnectKick = 0;
+
+// Called from loop() when idle. Detects link loss, keeps retrying the
+// connection (non-blocking — WiFi.begin returns immediately, association
+// finishes in the background), and sounds a cue on each meaningful transition.
+static void maintainWiFi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!wifiOnline) {
+      wifiOnline = true;
+      Serial.printf("[wifi] reconnected ip=%s rssi=%ld\n",
+                    WiFi.localIP().toString().c_str(), static_cast<long>(WiFi.RSSI()));
+      Serial.println("[audio_out] cue: wifi reconnected");
+      playWifiReconnectedCue();
+    }
+    return;
+  }
+
+  // Link is down.
+  if (wifiOnline) {
+    wifiOnline = false;
+    lastReconnectKick = 0;  // retry immediately on first loss
+    Serial.println("[wifi] connection lost");
+    Serial.println("[audio_out] cue: wifi lost");
+    playWifiLostCue();
+  }
+
+  const uint32_t now = millis();
+  if (lastReconnectKick == 0 || now - lastReconnectKick >= WIFI_RECONNECT_INTERVAL_MS) {
+    lastReconnectKick = now;
+    Serial.println("[wifi] reconnecting...");
+    Serial.println("[audio_out] cue: wifi retry");
+    playWifiTryBlip();
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   }
 }
 
@@ -928,6 +1012,7 @@ void setup() {
   Serial.printf("[boot] mic_gain=%ld playback_gain=%.2f\n", static_cast<long>(MIC_GAIN), PLAYBACK_GAIN);
 
   connectWiFi();
+  wifiOnline = (WiFi.status() == WL_CONNECTED);  // seed state so we don't re-cue at boot
 
   Serial.println("[audio_out] cue: ready");
   playReadyChime();
@@ -990,6 +1075,12 @@ void loop() {
         Serial.println("[button] short tap -> playback interrupted only");
       }
     }
+  }
+
+  // Only manage Wi-Fi when truly idle (not mid-recording / mid-gesture) so a
+  // reconnect attempt or cue never interferes with an active capture.
+  if (!pressed && !wasPressed) {
+    maintainWiFi();
   }
 
   delay(5);
