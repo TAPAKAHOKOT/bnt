@@ -26,7 +26,10 @@ logger = logging.getLogger("bnt.backend.openai")
 SYSTEM_PROMPT = (
     "Ты — голосовой ассистент в маленькой носимой кнопке. Отвечай разговорным языком, "
     "без списков и markdown. Держи ответ примерно до 50 слов — максимум два коротких абзаца, "
-    "если пользователь явно не попросил подробнее. Отвечай на языке пользователя."
+    "если пользователь явно не попросил подробнее. Отвечай на языке пользователя. "
+    "Если вопрос про актуальные события, цены, погоду или другую свежую информацию — "
+    "используй веб-поиск. Ответ зачитывается вслух, поэтому НЕ вставляй ссылки, URL или "
+    "сноски-цитаты; просто скажи факт своими словами."
 )
 
 
@@ -86,14 +89,19 @@ class OpenAIResponseService:
         return (getattr(result, "text", "") or "").strip()
 
     def _chat(self, transcript: str, history: list[dict[str, str]]) -> str:
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        messages.extend(history)
-        messages.append({"role": "user", "content": transcript})
-        completion = self._client.chat.completions.create(
+        # Responses API so the model can use the built-in web_search tool. The
+        # system prompt goes in `instructions`; prior turns + the new question
+        # go in `input`. The model decides on its own whether to search.
+        input_messages = list(history)
+        input_messages.append({"role": "user", "content": transcript})
+        tools = [{"type": "web_search"}] if self._config.web_search_enabled else []
+        response = self._client.responses.create(
             model=self._config.openai_chat_model,
-            messages=messages,
+            instructions=SYSTEM_PROMPT,
+            input=input_messages,
+            tools=tools,
         )
-        return (completion.choices[0].message.content or "").strip()
+        return (getattr(response, "output_text", "") or "").strip()
 
     def _synthesize(self, reply_text: str) -> bytes:
         response = self._client.audio.speech.create(

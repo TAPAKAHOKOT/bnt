@@ -35,6 +35,9 @@ class BackendConfig:
     openai_stt_model: str = DEFAULT_OPENAI_STT_MODEL
     openai_tts_model: str = DEFAULT_OPENAI_TTS_MODEL
     openai_tts_voice: str = DEFAULT_OPENAI_TTS_VOICE
+    # Give the chat model the built-in web_search tool so it can answer with
+    # up-to-date info. The model decides when to actually search.
+    web_search_enabled: bool = True
 
 
 def load_config() -> BackendConfig:
@@ -55,4 +58,6 @@ def load_config() -> BackendConfig:
         openai_stt_model=os.getenv("OPENAI_STT_MODEL", DEFAULT_OPENAI_STT_MODEL),
         openai_tts_model=os.getenv("OPENAI_TTS_MODEL", DEFAULT_OPENAI_TTS_MODEL),
         openai_tts_voice=os.getenv("OPENAI_TTS_VOICE", DEFAULT_OPENAI_TTS_VOICE),
+        web_search_enabled=os.getenv("BNT_WEB_SEARCH", "1").strip().lower()
+        not in ("0", "false", "no", "off", ""),
     )

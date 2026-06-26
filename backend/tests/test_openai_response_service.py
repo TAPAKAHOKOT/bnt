@@ -60,9 +60,8 @@ class _FakeOpenAIClient:
             transcriptions=SimpleNamespace(create=self._stt_create),
             speech=SimpleNamespace(create=self._tts_create),
         )
-        self.chat = SimpleNamespace(
-            completions=SimpleNamespace(create=self._chat_create)
-        )
+        # Chat now goes through the Responses API (so web_search can be used).
+        self.responses = SimpleNamespace(create=self._responses_create)
 
     def _stt_create(self, **kwargs):
         self.calls["stt"] = kwargs
@@ -70,12 +69,11 @@ class _FakeOpenAIClient:
             raise self._stt_exc
         return SimpleNamespace(text=self._transcript)
 
-    def _chat_create(self, **kwargs):
+    def _responses_create(self, **kwargs):
         self.calls["chat"] = kwargs
         if self._chat_exc:
             raise self._chat_exc
-        message = SimpleNamespace(content=self._reply)
-        return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+        return SimpleNamespace(output_text=self._reply)
 
     def _tts_create(self, **kwargs):
         self.calls["tts"] = kwargs
@@ -99,11 +97,14 @@ def test_pipeline_calls_stt_chat_tts_and_returns_mvp_wav() -> None:
     # All three OpenAI stages were exercised.
     assert {"stt", "chat", "tts"} <= set(client.calls)
 
-    # System prompt is delivered as the first chat message.
-    messages = client.calls["chat"]["messages"]
-    assert messages[0] == {"role": "system", "content": SYSTEM_PROMPT}
-    assert messages[1]["role"] == "user"
-    assert messages[1]["content"] == "Привет"
+    # System prompt is delivered as Responses `instructions`; the question is
+    # the last input message.
+    chat_call = client.calls["chat"]
+    assert chat_call["instructions"] == SYSTEM_PROMPT
+    assert chat_call["input"][-1] == {"role": "user", "content": "Привет"}
+
+    # Web search tool is offered by default.
+    assert {"type": "web_search"} in chat_call["tools"]
 
     # The chat reply is what gets synthesized.
     assert client.calls["tts"]["input"] == "Готово."
@@ -131,12 +132,20 @@ def test_multi_turn_includes_prior_history_in_chat() -> None:
     service2 = OpenAIResponseService(_config(), client=second_client, memory=memory)
     service2.generate_response_audio(make_sine_wav())
 
-    messages = second_client.calls["chat"]["messages"]
-    # system + prior (user/assistant) + new user
-    assert messages[0]["role"] == "system"
-    assert messages[1] == {"role": "user", "content": "Привет"}
-    assert messages[2] == {"role": "assistant", "content": "раз"}
-    assert messages[-1] == {"role": "user", "content": "а ещё?"}
+    input_messages = second_client.calls["chat"]["input"]
+    # prior (user/assistant) + new user; system prompt lives in `instructions`.
+    assert input_messages[0] == {"role": "user", "content": "Привет"}
+    assert input_messages[1] == {"role": "assistant", "content": "раз"}
+    assert input_messages[-1] == {"role": "user", "content": "а ещё?"}
+
+
+def test_web_search_can_be_disabled() -> None:
+    client = _FakeOpenAIClient()
+    service = OpenAIResponseService(_config(web_search_enabled=False), client=client)
+
+    service.generate_response_audio(make_sine_wav())
+
+    assert client.calls["chat"]["tools"] == []
 
 
 def test_resamples_tts_audio_to_16k() -> None:
