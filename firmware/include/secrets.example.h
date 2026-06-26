@@ -13,3 +13,7 @@
 // Local backend reachable from the ESP32 on the same Wi-Fi network.
 // Example: laptop running the backend at 192.168.1.50:8000
 #define BNT_BACKEND_URL "http://192.168.1.50:8000/ask-audio"
+
+// Shared secret sent as `Authorization: Bearer <token>`. Must match the
+// backend's BNT_API_TOKEN env var, otherwise the backend returns 401.
+#define BNT_API_TOKEN "your-shared-api-token"

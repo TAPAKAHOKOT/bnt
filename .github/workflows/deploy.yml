@@ -42,8 +42,12 @@ jobs:
             set -e
             cd "${{ secrets.SERVER_PATH }}"
             # Write the runtime env file (compose reads it via env_file).
-            cat > .env <<EOF
+            # Quoted heredoc delimiter ('EOF') so the shell does NOT expand $ in
+            # secret values — GitHub substitutes ${{ }} before the shell runs, so
+            # tokens with $, #, * etc. land verbatim and match the firmware token.
+            cat > .env <<'EOF'
             OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+            BNT_API_TOKEN=${{ secrets.BNT_API_TOKEN }}
             EOF
             chmod 600 .env
             docker compose up -d --build

@@ -26,6 +26,10 @@ class BackendConfig:
     # Multi-turn memory: keep dialogue context this long after the first message,
     # then clear so the next message starts a fresh conversation. 0 disables it.
     conversation_ttl_ms: int = 300_000  # 5 minutes
+    # Shared secret the device must send as `Authorization: Bearer <token>`.
+    # When None (unset), auth is disabled so local dev and tests work without it;
+    # production sets BNT_API_TOKEN so the public endpoint is not open to all.
+    api_token: str | None = None
     openai_api_key: str | None = None
     openai_chat_model: str = DEFAULT_OPENAI_CHAT_MODEL
     openai_stt_model: str = DEFAULT_OPENAI_STT_MODEL
@@ -45,6 +49,7 @@ def load_config() -> BackendConfig:
         log_level=os.getenv("BNT_LOG_LEVEL", "info"),
         response_timeout_ms=int(os.getenv("BNT_RESPONSE_TIMEOUT_MS", "30000")),
         conversation_ttl_ms=int(os.getenv("BNT_CONVERSATION_TTL_MS", "300000")),
+        api_token=os.getenv("BNT_API_TOKEN") or None,
         openai_api_key=api_key,
         openai_chat_model=os.getenv("OPENAI_CHAT_MODEL", DEFAULT_OPENAI_CHAT_MODEL),
         openai_stt_model=os.getenv("OPENAI_STT_MODEL", DEFAULT_OPENAI_STT_MODEL),

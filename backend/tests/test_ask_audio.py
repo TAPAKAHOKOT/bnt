@@ -65,6 +65,42 @@ def test_ask_audio_rejects_wrong_content_type() -> None:
     assert response.json()["error"]["code"] == "invalid_audio"
 
 
+def test_ask_audio_rejects_missing_token_when_configured() -> None:
+    app.dependency_overrides[load_config] = lambda: BackendConfig(api_token="secret-token")
+
+    response = client.post("/ask-audio", content=make_sine_wav(), headers={"Content-Type": "audio/wav"})
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "unauthorized"
+
+
+def test_ask_audio_rejects_wrong_token_when_configured() -> None:
+    app.dependency_overrides[load_config] = lambda: BackendConfig(api_token="secret-token")
+
+    response = client.post(
+        "/ask-audio",
+        content=make_sine_wav(),
+        headers={"Content-Type": "audio/wav", "Authorization": "Bearer wrong-token"},
+    )
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "unauthorized"
+
+
+def test_ask_audio_accepts_matching_token() -> None:
+    app.dependency_overrides[load_config] = lambda: BackendConfig(api_token="secret-token")
+
+    response = client.post(
+        "/ask-audio",
+        content=make_sine_wav(),
+        headers={"Content-Type": "audio/wav", "Authorization": "Bearer secret-token"},
+    )
+
+    assert response.status_code == 200
+    info = validate_mvp_wav(response.content)
+    assert info.frames > 0
+
+
 def test_ask_audio_rejects_oversized_audio() -> None:
     app.dependency_overrides[load_config] = lambda: BackendConfig(max_request_bytes=10)
 

@@ -30,6 +30,12 @@ static constexpr uint32_t THINKING_FREQ_HZ = 440;
 static constexpr uint32_t THINKING_BLIP_MS = 60;
 static constexpr float THINKING_GAIN = 0.05f;
 static constexpr uint32_t THINKING_INTERVAL_MS = 700;
+// Descending low double-beep: signals a failed backend request (offline,
+// connect/timeout, or non-200 status). Deliberately lower than the record
+// cues so a failure sounds distinct from normal operation.
+static constexpr uint32_t ERROR_FREQ_HI_HZ = 440;
+static constexpr uint32_t ERROR_FREQ_LO_HZ = 220;
+static constexpr uint32_t ERROR_BEEP_MS = 200;
 static constexpr int32_t MIC_GAIN = 3;
 static constexpr float PLAYBACK_GAIN = 1.0f;  // unity — no extra amplification
 // Time to let the speaker I2S DMA drain to the DAC before muting. Must exceed
@@ -292,6 +298,25 @@ static void playCue(uint32_t freqHz) {
   writeToneToI2S(freqHz, BEEP_DURATION_MS, BEEP_GAIN);
   writeSpeakerSilence(30);
   delay(SPEAKER_DRAIN_MS);  // let the DMA play out — do NOT zero it (that drops the cue)
+  setAmpEnabled(false);
+  delay(10);
+  stopI2S();
+  silenceSpeakerPins();
+}
+
+
+// Two descending low tones to signal the backend request failed. Same
+// setup/teardown shape as playCue; safe to call after finishUploadAndPlay()
+// has already torn the speaker down on its error paths.
+static void playErrorCue() {
+  startSpeakerI2S();
+  setAmpEnabled(true);
+  delay(8);
+  writeSpeakerSilence(60);  // let the amp soft-unmute before the tones
+  writeToneToI2S(ERROR_FREQ_HI_HZ, ERROR_BEEP_MS, BEEP_GAIN);
+  writeToneToI2S(ERROR_FREQ_LO_HZ, ERROR_BEEP_MS, BEEP_GAIN);
+  writeSpeakerSilence(30);
+  delay(SPEAKER_DRAIN_MS);  // let the DMA play out before muting
   setAmpEnabled(false);
   delay(10);
   stopI2S();
@@ -675,6 +700,7 @@ static bool beginUpload() {
   uploadClient.printf("Host: %s:%u\r\n", host, static_cast<unsigned int>(port));
   uploadClient.print("Content-Type: audio/L16;rate=16000;channels=1\r\n");
   uploadClient.print("Transfer-Encoding: chunked\r\n");
+  uploadClient.printf("Authorization: Bearer %s\r\n", BNT_API_TOKEN);
   uploadClient.print("Connection: close\r\n\r\n");
 
   uploadActive = true;
@@ -893,6 +919,8 @@ void loop() {
     playCue(REC_END_FREQ_HZ);
     if (!finishUploadAndPlay()) {
       Serial.println("[audio_out] no response (upload failed or offline)");
+      Serial.println("[audio_out] cue: error");
+      playErrorCue();  // negative double-beep so the user hears the failure
     }
   }
 

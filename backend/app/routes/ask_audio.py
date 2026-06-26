@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets
 import time
 import uuid
 
@@ -41,16 +42,33 @@ def get_response_service(config: BackendConfig = Depends(load_config)) -> Respon
     return FakeResponseService()
 
 
+def _is_authorized(config: BackendConfig, authorization: str | None) -> bool:
+    # No token configured -> auth disabled (local dev/tests).
+    if not config.api_token:
+        return True
+    if not authorization:
+        return False
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        return False
+    # Constant-time compare so a wrong token can't be guessed via timing.
+    return secrets.compare_digest(token, config.api_token)
+
+
 @router.post("/ask-audio")
 async def ask_audio(
     request: Request,
     content_type: str | None = Header(default=None),
     content_length: int | None = Header(default=None),
+    authorization: str | None = Header(default=None),
     config: BackendConfig = Depends(load_config),
     response_service: ResponseService = Depends(get_response_service),
 ) -> Response:
     request_id = str(uuid.uuid4())
     started = time.monotonic()
+
+    if not _is_authorized(config, authorization):
+        return _error("unauthorized", "Missing or invalid API token", request_id, status_code=401)
 
     base_type = (content_type or "").split(";")[0].strip().lower()
     is_raw_pcm = base_type in _RAW_PCM_CONTENT_TYPES
