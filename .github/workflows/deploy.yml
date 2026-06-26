@@ -50,6 +50,10 @@ jobs:
             BNT_API_TOKEN=${{ secrets.BNT_API_TOKEN }}
             EOF
             chmod 600 .env
+            # docker compose interpolates $ in env_file values, so a literal $ in
+            # a token gets eaten. Double every $ to $$ so compose restores it to a
+            # single literal $ in the container env.
+            sed -i 's/\$/$$/g' .env
             docker compose up -d --build
             docker image prune -f
             docker compose ps
