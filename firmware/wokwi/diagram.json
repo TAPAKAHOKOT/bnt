@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "author": "BNT",
+  "editor": "wokwi",
+  "parts": [
+    { "type": "wokwi-esp32-devkit-v1", "id": "esp", "top": 0, "left": 0, "attrs": {} },
+    { "type": "chip-inmp441", "id": "mic", "top": 120, "left": -340, "attrs": {} },
+    { "type": "chip-max98357", "id": "amp", "top": 330, "left": 330, "attrs": {} },
+    { "type": "wokwi-pushbutton", "id": "btn", "top": 540, "left": -260, "attrs": { "color": "green", "label": "BUTTON GPIO13" } }
+  ],
+  "connections": [
+    [ "esp:D13", "btn:1.l", "green", [] ],
+    [ "btn:2.l", "esp:GND.1", "black", [] ],
+
+    [ "mic:VDD", "esp:3V3", "red", [] ],
+    [ "mic:GND", "esp:GND.2", "black", [] ],
+    [ "mic:SCK", "esp:D26", "yellow", [] ],
+    [ "mic:WS", "esp:D25", "blue", [] ],
+    [ "mic:SD", "esp:D33", "green", [] ],
+    [ "mic:L/R", "esp:GND.2", "black", [] ],
+
+    [ "amp:Vin", "esp:VIN", "red", [] ],
+    [ "amp:GND", "esp:GND.3", "black", [] ],
+    [ "amp:BCLK", "esp:D27", "yellow", [] ],
+    [ "amp:LRC", "esp:D22", "blue", [] ],
+    [ "amp:DIN", "esp:D21", "green", [] ],
+    [ "amp:SD", "esp:D14", "orange", [] ]
+  ],
+  "dependencies": {}
+}

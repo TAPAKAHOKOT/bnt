@@ -1,0 +1,14 @@
+{
+  "name": "MAX98357",
+  "author": "BNT",
+  "pins": [
+    "Vin",
+    "GND",
+    "SD",
+    "GAIN",
+    "DIN",
+    "BCLK",
+    "LRC"
+  ],
+  "controls": []
+}

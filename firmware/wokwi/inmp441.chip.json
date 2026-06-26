@@ -1,0 +1,13 @@
+{
+  "name": "INMP441",
+  "author": "BNT",
+  "pins": [
+    "VDD",
+    "GND",
+    "L/R",
+    "WS",
+    "SCK",
+    "SD"
+  ],
+  "controls": []
+}
