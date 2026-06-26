@@ -1,9 +1,19 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiMulti.h>
 #include <stdlib.h>
 #include <string.h>
 #include "driver/i2s.h"
 #include "secrets.h"
+
+// Wi-Fi networks from secrets.h. WiFiMulti connects to the strongest reachable
+// one and falls back to the others.
+struct WifiCred {
+  const char *ssid;
+  const char *password;
+};
+static const WifiCred WIFI_NETWORKS[] = {WIFI_NETWORKS_INIT};
+static const size_t WIFI_NETWORK_COUNT = sizeof(WIFI_NETWORKS) / sizeof(WIFI_NETWORKS[0]);
 
 // Confirmed breadboard wiring.
 #define PIN_SPK_BCLK 27
@@ -53,6 +63,10 @@ static constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
 // While offline, retry the Wi-Fi link this often (each attempt sounds a blip).
 static constexpr uint32_t WIFI_RECONNECT_INTERVAL_MS = 5000;
 static constexpr uint32_t WIFI_RECONNECT_BLIP_MS = 90;
+// Keep retrying for this long after a loss/boot failure, then give up until a
+// button press re-arms the attempts. Per-attempt connect timeout for run().
+static constexpr uint32_t WIFI_RETRY_WINDOW_MS = 60000;
+static constexpr uint32_t WIFI_CONNECT_ATTEMPT_MS = 6000;
 static constexpr uint32_t HTTP_TIMEOUT_MS = 10000;
 // The backend runs STT -> chat -> TTS via OpenAI, which can take tens of seconds
 // (slow/retried calls). Wait this long for the response status before giving up.
@@ -93,6 +107,7 @@ struct RecordingStats {
 // button is held — no audio buffer is kept, so recording length is unbounded.
 static WiFiClient uploadClient;
 static bool uploadActive = false;
+static WiFiMulti wifiMulti;
 static size_t recordingSampleCount = 0;  // total samples streamed (for stats/logs)
 static uint32_t recordingStartedAt = 0;
 static uint32_t recordingPeak = 0;
@@ -362,11 +377,11 @@ static void playWifiReconnectedCue() {
   playToneSequence(f, d, 2, BEEP_GAIN);
 }
 
-// Quiet single blip emitted on each reconnect attempt so the user hears it trying.
+// Single blip emitted on each connect attempt so the user hears it trying.
 static void playWifiTryBlip() {
   static const uint32_t f[] = {392};
   static const uint32_t d[] = {WIFI_RECONNECT_BLIP_MS};
-  playToneSequence(f, d, 1, THINKING_GAIN);
+  playToneSequence(f, d, 1, BEEP_GAIN);
 }
 
 
@@ -915,26 +930,27 @@ static void scanVisibleNetworks() {
 // report the IP. No request is sent yet. Failure is non-fatal — the device
 // still runs the local record/playback loop so hardware stays usable.
 static void connectWiFi() {
-  Serial.printf("[wifi] connecting ssid=%s\n", WIFI_SSID);
-
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);  // let the stack also reconnect on its own
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-  const uint32_t startedAt = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startedAt < WIFI_CONNECT_TIMEOUT_MS) {
-    delay(250);
+  // Register every known network; WiFiMulti connects to the strongest reachable.
+  for (size_t i = 0; i < WIFI_NETWORK_COUNT; ++i) {
+    Serial.printf("[wifi] known network #%u ssid=%s\n",
+                  static_cast<unsigned int>(i + 1), WIFI_NETWORKS[i].ssid);
+    wifiMulti.addAP(WIFI_NETWORKS[i].ssid, WIFI_NETWORKS[i].password);
   }
+
+  Serial.println("[wifi] connecting (strongest known network)...");
+  wifiMulti.run(WIFI_CONNECT_TIMEOUT_MS);
 
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf(
-        "[wifi] connected ip=%s rssi=%ld backend=%s\n",
+        "[wifi] connected ssid=%s ip=%s rssi=%ld backend=%s\n",
+        WiFi.SSID().c_str(),
         WiFi.localIP().toString().c_str(),
         static_cast<long>(WiFi.RSSI()),
         BNT_BACKEND_URL);
   } else {
-    // status() codes: 1=NO_SSID_AVAIL (not seen / 5GHz), 4=CONNECT_FAILED
-    // (often wrong password), 6=DISCONNECTED.
     Serial.printf(
         "[wifi] failed status=%d: continuing offline (local record/playback only)\n",
         static_cast<int>(WiFi.status()));
@@ -943,19 +959,31 @@ static void connectWiFi() {
 }
 
 // Wi-Fi link state for maintainWiFi(): track transitions so a cue sounds only
-// when the link actually changes, and throttle reconnect attempts.
+// when the link actually changes, throttle attempts, and bound the retry window.
 static bool wifiOnline = false;
+static bool wifiRetrying = false;     // inside an active retry window
+static uint32_t retryWindowStart = 0;  // when the current window began
 static uint32_t lastReconnectKick = 0;
 
-// Called from loop() when idle. Detects link loss, keeps retrying the
-// connection (non-blocking — WiFi.begin returns immediately, association
-// finishes in the background), and sounds a cue on each meaningful transition.
+// (Re)start a bounded window of reconnect attempts. Called on link loss and
+// when the user presses the button while offline.
+static void armWifiRetry() {
+  wifiRetrying = true;
+  retryWindowStart = millis();
+  lastReconnectKick = 0;  // attempt immediately on the next maintainWiFi()
+}
+
+// Called from loop() when idle. Detects link loss, retries the connection
+// (strongest known AP via WiFiMulti) for a bounded window, then gives up until
+// re-armed. Sounds a cue on each meaningful transition.
 static void maintainWiFi() {
   if (WiFi.status() == WL_CONNECTED) {
     if (!wifiOnline) {
       wifiOnline = true;
-      Serial.printf("[wifi] reconnected ip=%s rssi=%ld\n",
-                    WiFi.localIP().toString().c_str(), static_cast<long>(WiFi.RSSI()));
+      wifiRetrying = false;
+      Serial.printf("[wifi] reconnected ssid=%s ip=%s rssi=%ld\n",
+                    WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(),
+                    static_cast<long>(WiFi.RSSI()));
       Serial.println("[audio_out] cue: wifi reconnected");
       playWifiReconnectedCue();
     }
@@ -965,10 +993,21 @@ static void maintainWiFi() {
   // Link is down.
   if (wifiOnline) {
     wifiOnline = false;
-    lastReconnectKick = 0;  // retry immediately on first loss
     Serial.println("[wifi] connection lost");
     Serial.println("[audio_out] cue: wifi lost");
     playWifiLostCue();
+    armWifiRetry();
+  }
+
+  if (!wifiRetrying) {
+    return;  // gave up earlier; wait for a button press to re-arm
+  }
+
+  // Stop retrying once the window elapses (saves power / silences the blips).
+  if (millis() - retryWindowStart >= WIFI_RETRY_WINDOW_MS) {
+    wifiRetrying = false;
+    Serial.println("[wifi] giving up reconnect (press the button to retry)");
+    return;
   }
 
   const uint32_t now = millis();
@@ -977,8 +1016,7 @@ static void maintainWiFi() {
     Serial.println("[wifi] reconnecting...");
     Serial.println("[audio_out] cue: wifi retry");
     playWifiTryBlip();
-    WiFi.disconnect();
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    wifiMulti.run(WIFI_CONNECT_ATTEMPT_MS);  // scans + connects to strongest known AP
   }
 }
 
@@ -1013,6 +1051,9 @@ void setup() {
 
   connectWiFi();
   wifiOnline = (WiFi.status() == WL_CONNECTED);  // seed state so we don't re-cue at boot
+  if (!wifiOnline) {
+    armWifiRetry();  // keep trying for the retry window even if boot failed
+  }
 
   Serial.println("[audio_out] cue: ready");
   playReadyChime();
@@ -1020,25 +1061,47 @@ void setup() {
 
 void loop() {
   static bool wasPressed = false;
+  static bool recording = false;  // true only while an actual capture is in progress
   const bool pressed = readDebouncedButtonPressed();
 
   if (pressed && !wasPressed) {
     wasPressed = true;
     Serial.println("[button] pressed");
-    Serial.println("[audio_out] cue: record start");
-    playCue(REC_START_FREQ_HZ);
-    beginUpload();  // open chunked connection before recording (sets uploadActive)
-    startMicI2S();
-    resetRecordingStats();
+    if (WiFi.status() != WL_CONNECTED) {
+      // Offline: don't record. Sound the connecting cue and (re)arm retries.
+      Serial.println("[button] offline -> (re)arm wifi connect");
+      Serial.println("[audio_out] cue: wifi retry");
+      playWifiTryBlip();
+      armWifiRetry();
+      recording = false;
+    } else {
+      Serial.println("[audio_out] cue: record start");
+      playCue(REC_START_FREQ_HZ);
+      beginUpload();  // open chunked connection before recording (sets uploadActive)
+      startMicI2S();
+      resetRecordingStats();
+      recording = true;
+    }
   }
 
   if (pressed) {
-    recordMicWhileHeld();  // streams each mic chunk to the open upload
+    if (recording) {
+      recordMicWhileHeld();  // streams each mic chunk to the open upload
+    } else {
+      delay(5);  // offline press held: nothing to capture, just wait for release
+    }
     return;  // skip the idle delay; i2s_read paces the capture loop in real time
   }
 
-  if (!pressed && wasPressed) {
+  if (!pressed && wasPressed && !recording) {
+    // Released an offline (connect) press — nothing to finish.
     wasPressed = false;
+    Serial.println("[button] released (offline press)");
+  }
+
+  if (!pressed && wasPressed && recording) {
+    wasPressed = false;
+    recording = false;
     Serial.println("[button] released");
     stopMic();
     printRecordingSummary();
@@ -1070,7 +1133,8 @@ void loop() {
         beginUpload();
         startMicI2S();
         resetRecordingStats();
-        wasPressed = true;  // continue capturing until release (normal flow)
+        wasPressed = true;   // continue capturing until release (normal flow)
+        recording = true;
       } else {
         Serial.println("[button] short tap -> playback interrupted only");
       }
