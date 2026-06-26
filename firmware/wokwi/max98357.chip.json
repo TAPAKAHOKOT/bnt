@@ -8,7 +8,9 @@
     "GAIN",
     "DIN",
     "BCLK",
-    "LRC"
+    "LRC",
+    "OUT+",
+    "OUT-"
   ],
   "controls": []
 }

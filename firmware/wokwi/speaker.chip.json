@@ -1,0 +1,9 @@
+{
+  "name": "Speaker 1W 8R 40mm",
+  "author": "BNT",
+  "pins": [
+    "+",
+    "-"
+  ],
+  "controls": []
+}

@@ -10,10 +10,11 @@ labeled blocks with the correct pin names (no audio emulation, wiring view only)
 ## Open in Wokwi
 
 1. Go to https://wokwi.com → **New Project** → pick **ESP32**.
-2. Create the two custom chips. For each one, click the **+** (Add file) and add
+2. Create the custom chips. For each one, click the **+** (Add file) and add
    both files with the exact names:
    - `inmp441.chip.json` and `inmp441.chip.c`
    - `max98357.chip.json` and `max98357.chip.c`
+   - `speaker.chip.json` and `speaker.chip.c`
 
    Paste the contents from this folder.
 3. Open the `diagram.json` tab and replace its contents with the `diagram.json`
@@ -39,3 +40,10 @@ copy the updated `diagram.json` back here if you want to keep changes.
 | Amp enable  | GPIO14 | — | SD (HIGH = on) |
 | Amp power   | VIN/5V | — | Vin (3V3 also works) |
 | Grounds     | GND    | GND | GND |
+
+Speaker (1W, 8Ω, 40mm, 5mm thick) connects to the MAX98357 output:
+
+| MAX98357 | Speaker |
+|----------|---------|
+| OUT+     | +       |
+| OUT-     | −       |
